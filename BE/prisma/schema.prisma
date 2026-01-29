@@ -1,0 +1,70 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Generation {
+  id                String   @id
+  prompt            String?
+  modelId           String?
+  modelName         String
+  duration          String
+  aspectRatio       String
+  resolution        String
+  audioEnabled      Boolean  @default(true)
+  feature           String
+  generationType    String
+  status            String   @default("in_progress")
+  inputVideoUrl     String?
+  inputImageUrl     String?
+  characterImageUrl String?
+  thumbnailUrl      String?
+  videoUrl          String?
+  imageUrl          String?
+  providerJobId     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime
+  errorCode         String?
+  errorMessage      String?
+  autoPostToTiktok  Boolean  @default(false)
+  tiktokPostId      String?
+  tiktokPostStatus  String?
+  Model             Model?   @relation(fields: [modelId], references: [id])
+
+  @@index([createdAt])
+  @@index([status])
+}
+
+model Model {
+  id         String       @id
+  name       String
+  category   String
+  createdAt  DateTime     @default(now())
+  Generation Generation[]
+
+  @@unique([name, category])
+}
+
+model TiktokSettings {
+  id                    String   @id @default("default")
+  autoPostMotionControl Boolean  @default(false)
+  defaultPrivacyLevel   String   @default("PUBLIC_TO_EVERYONE")
+  defaultTitle          String   @default("")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime
+}
+
+model TiktokToken {
+  id           String   @id
+  openId       String   @unique
+  accessToken  String
+  refreshToken String
+  expiresAt    DateTime
+  scope        String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime
+}
