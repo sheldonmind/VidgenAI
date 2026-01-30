@@ -6,10 +6,13 @@ import { upload } from "../middleware/upload";
 import { parseBoolean } from "../utils/parse";
 import { veo3Service } from "../services/veo3Service";
 import { klingService } from "../services/klingService";
+import { imagenService } from "../services/imagenService";
+import { geminiImageService } from "../services/geminiImageService";
 import { checkNow as checkPendingGenerations, startGenerationPoller } from "../services/generationPoller";
 import { downloadAndSaveVideo, downloadAndSaveThumbnail, generateVideoThumbnail, deleteFile } from "../utils/storage";
 import { uploadLocalFileToCloudinary, deleteFromCloudinary, extractPublicId } from "../services/cloudinaryService";
 import axios from "axios";
+import { CONSTRUCTION_STAGES, BASE_PROMPT, buildStagePrompt, getAllStages } from "../config/constructionStages";
 
 const router = Router();
 
@@ -97,10 +100,6 @@ router.post(
   ]),
   async (req, res, next) => {
     try {
-      // Log request body for debugging
-      console.log('📥 Request body:', req.body);
-      console.log('📥 Request body keys:', Object.keys(req.body));
-      
       let parsed;
       try {
         parsed = createGenerationSchema.parse(req.body);
@@ -131,7 +130,6 @@ router.post(
       const startFrameFile = files?.startFrame?.[0];
       const endFrameFile = files?.endFrame?.[0];
 
-      // Upload input files to Cloudinary (REQUIRED - no fallback to local URLs)
       let inputVideoUrl: string | undefined;
       let inputImageUrl: string | undefined;
       let characterImageUrl: string | undefined;
@@ -152,7 +150,6 @@ router.post(
 
       if (startFrameFile) {
         startFrameUrl = await uploadLocalFileToCloudinary(startFrameFile.filename, 'image');
-        // For text-to-image with start frame, use startFrameUrl as inputImageUrl
         if (!inputImageUrl) {
           inputImageUrl = startFrameUrl;
         }
@@ -196,14 +193,28 @@ router.post(
 
       const autoPostToTiktok = parseBoolean(parsed.autoPostToTiktok);
       
-      console.log('✅ Creating generation with:', {
-        modelName,
-        generationType,
-        feature,
-        duration: parsed.duration,
-        aspectRatio: parsed.aspectRatio,
-        resolution: parsed.resolution
-      });
+      // Validate that the model supports the requested generation type
+      const lowerModelName = modelName?.toLowerCase() || '';
+      const isKlingModel = lowerModelName.includes('kling');
+      const isImagenModel = lowerModelName.includes('imagen');
+      const isNanoBananaModel = lowerModelName.includes('nano banana');
+      const isGeminiModel = isNanoBananaModel; // Nano Banana uses Gemini API
+      const isVeoModel = !isKlingModel && !isImagenModel && !isGeminiModel;
+      const isImageGeneration = generationType === "text-to-image" || generationType === "image-to-image";
+      
+      if (isVeoModel && isImageGeneration) {
+        return res.status(400).json({ 
+          error: `Model "${modelName}" does not support ${generationType}. Veo models only support video generation (text-to-video, image-to-video).`,
+          supportedFeatures: ["text-to-video", "image-to-video"]
+        });
+      }
+      
+      if ((isImagenModel || isGeminiModel) && !isImageGeneration) {
+        return res.status(400).json({ 
+          error: `Model "${modelName}" only supports image generation (text-to-image, image-to-image). For video generation, please use Veo or Kling models.`,
+          supportedFeatures: ["text-to-image", "image-to-image"]
+        });
+      }
       
       const generation = await prisma.generation.create({
         data: {
@@ -225,17 +236,32 @@ router.post(
           updatedAt: new Date()
         } as any
       });
-      
-      console.log('✅ Generation created successfully:', generation.id);
 
-      // Determine which service to use based on model name
-      const isKlingModel = modelName?.toLowerCase().includes('kling');
-      
-      if (isKlingModel && klingService.isConfigured()) {
+      // Determine which service to use based on model name (already defined above)
+      if (isGeminiModel && geminiImageService.isConfigured() && isImageGeneration) {
+        // Use Gemini service for Nano Banana models
+        processGeminiGeneration(generation.id, {
+          prompt: parsed.prompt,
+          modelName,
+          aspectRatio: parsed.aspectRatio,
+          generationType,
+          inputImageUrl
+        }).catch(() => {});
+      } else if (isImagenModel && imagenService.isConfigured() && isImageGeneration) {
+        const imageStrength = parsed.imageStrength ? parseFloat(parsed.imageStrength) : undefined;
+        
+        processImagenGeneration(generation.id, {
+          prompt: parsed.prompt,
+          modelName,
+          aspectRatio: parsed.aspectRatio,
+          generationType,
+          inputImageUrl,
+          imageStrength
+        }).catch(() => {});
+      } else if (isKlingModel && klingService.isConfigured()) {
         const imageStrength = parsed.imageStrength ? parseFloat(parsed.imageStrength) : undefined;
         const numberOfImages = parsed.numberOfImages ? parseInt(parsed.numberOfImages) : undefined;
         
-        console.log('🚀 Starting Kling generation process');
         processKlingGeneration(generation.id, {
           prompt: parsed.prompt,
           modelName,
@@ -251,9 +277,7 @@ router.post(
           imageStrength,
           numberOfImages,
           endFrameUrl
-        }).catch((err) => {
-          console.error('❌ Error in processKlingGeneration (caught):', err);
-        });
+        }).catch(() => {});
       } else if (veo3Service.isConfigured()) {
         processVeo3Generation(generation.id, {
           prompt: parsed.prompt,
@@ -270,13 +294,10 @@ router.post(
         }).catch(() => {});
       }
 
-      // Restart smart polling if it was stopped (when new video generation starts)
       startGenerationPoller();
 
       res.status(201).json({ data: generation });
     } catch (error: any) {
-      console.error('❌ Error creating generation:', error.message);
-      console.error('❌ Error stack:', error.stack);
       next(error);
     }
   }
@@ -340,16 +361,11 @@ router.patch("/:id", async (req, res, next) => {
   }
 });
 
-/**
- * Helper function to delete file from both local storage and Cloudinary
- */
 async function deleteFileFromAllLocations(fileUrl: string, resourceType: 'image' | 'video' = 'video'): Promise<void> {
   if (!fileUrl) return;
   
-  // Delete from local storage
   deleteFile(fileUrl);
   
-  // Delete from Cloudinary if it's a Cloudinary URL
   if (fileUrl.includes('cloudinary.com')) {
     const publicId = extractPublicId(fileUrl);
     if (publicId) {
@@ -358,9 +374,65 @@ async function deleteFileFromAllLocations(fileUrl: string, resourceType: 'image'
   }
 }
 
-/**
- * Delete a generation and its associated files
- */
+// Bulk delete multiple generations
+router.post("/bulk-delete", async (req, res, next) => {
+  try {
+    const { ids } = req.body;
+
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      res.status(400).json({ error: "Invalid request: 'ids' must be a non-empty array" });
+      return;
+    }
+
+    // Fetch all generations to be deleted
+    const generations = await prisma.generation.findMany({
+      where: { id: { in: ids } }
+    });
+
+    if (generations.length === 0) {
+      res.status(404).json({ error: "No generations found with the provided IDs" });
+      return;
+    }
+
+    // Delete all associated files
+    const fileDeletePromises: Promise<void>[] = [];
+    
+    for (const generation of generations) {
+      if (generation.videoUrl) {
+        fileDeletePromises.push(deleteFileFromAllLocations(generation.videoUrl, 'video'));
+      }
+      if (generation.thumbnailUrl && generation.thumbnailUrl !== generation.videoUrl) {
+        fileDeletePromises.push(deleteFileFromAllLocations(generation.thumbnailUrl, 'image'));
+      }
+      if (generation.inputVideoUrl) {
+        fileDeletePromises.push(deleteFileFromAllLocations(generation.inputVideoUrl, 'video'));
+      }
+      if (generation.inputImageUrl) {
+        fileDeletePromises.push(deleteFileFromAllLocations(generation.inputImageUrl, 'image'));
+      }
+      if (generation.characterImageUrl) {
+        fileDeletePromises.push(deleteFileFromAllLocations(generation.characterImageUrl, 'image'));
+      }
+    }
+
+    // Delete files (don't wait for all to complete, use allSettled)
+    await Promise.allSettled(fileDeletePromises);
+
+    // Delete generations from database
+    await prisma.generation.deleteMany({
+      where: { id: { in: ids } }
+    });
+
+    res.json({ 
+      success: true, 
+      message: `Successfully deleted ${generations.length} generation(s)`,
+      deletedCount: generations.length
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.delete("/:id", async (req, res, next) => {
   try {
     const generation = await prisma.generation.findUnique({
@@ -372,7 +444,6 @@ router.delete("/:id", async (req, res, next) => {
       return;
     }
 
-    // Delete associated files from both local storage and Cloudinary
     const deletePromises: Promise<void>[] = [];
     
     if (generation.videoUrl) {
@@ -391,10 +462,8 @@ router.delete("/:id", async (req, res, next) => {
       deletePromises.push(deleteFileFromAllLocations(generation.characterImageUrl, 'image'));
     }
 
-    // Wait for all delete operations to complete (don't block on errors)
     await Promise.allSettled(deletePromises);
 
-    // Delete from database
     await prisma.generation.delete({
       where: { id: req.params.id }
     });
@@ -405,9 +474,6 @@ router.delete("/:id", async (req, res, next) => {
   }
 });
 
-/**
- * Manual status check endpoint for debugging
- */
 router.post("/:id/check-status", async (req, res, next) => {
   try {
     const generation = await prisma.generation.findUnique({
@@ -425,9 +491,84 @@ router.post("/:id/check-status", async (req, res, next) => {
     }
 
     const isKlingModel = generation.modelName?.toLowerCase().includes('kling');
+    const isImagenModel = generation.modelName?.toLowerCase().includes('imagen');
+    
+    if (isImagenModel) {
+      const status = await imagenService.checkGenerationStatus(generation.providerJobId);
+
+      if (status.done) {
+        if (status.error) {
+          await prisma.generation.update({
+            where: { id: generation.id },
+            data: {
+              status: "failed",
+              updatedAt: new Date()
+            }
+          });
+          res.json({ 
+            data: { 
+              ...generation, 
+              status: "failed" 
+            }, 
+            imagenStatus: status 
+          });
+          return;
+        }
+
+        const imageUrl = imagenService.extractImageUrl(status);
+
+        if (imageUrl) {
+          try {
+            let cloudinaryImageUrl: string;
+            
+            if (imageUrl.startsWith('data:')) {
+              const base64Data = imageUrl.split(',')[1];
+              const buffer = Buffer.from(base64Data, 'base64');
+              const filename = `imagen-${Date.now()}.png`;
+              const fs = await import('fs/promises');
+              const path = await import('path');
+              const uploadsDir = path.join(process.cwd(), 'uploads');
+              await fs.mkdir(uploadsDir, { recursive: true });
+              const filepath = path.join(uploadsDir, filename);
+              await fs.writeFile(filepath, buffer);
+              
+              cloudinaryImageUrl = await uploadLocalFileToCloudinary(filename, 'image');
+            } else {
+              const imageFilename = await downloadAndSaveThumbnail(imageUrl, process.env.GOOGLE_API_KEY);
+              cloudinaryImageUrl = await uploadLocalFileToCloudinary(imageFilename, 'image');
+            }
+            
+            const updated = await prisma.generation.update({
+              where: { id: generation.id },
+              data: {
+                status: "completed",
+                imageUrl: cloudinaryImageUrl,
+                thumbnailUrl: cloudinaryImageUrl,
+                updatedAt: new Date()
+              } as any
+            });
+            res.json({ data: updated, imagenStatus: status });
+            return;
+          } catch (downloadError: any) {
+            const updated = await prisma.generation.update({
+              where: { id: generation.id },
+              data: {
+                status: "failed",
+                errorMessage: `Failed to upload image to Cloudinary: ${downloadError.message}`,
+                updatedAt: new Date()
+              }
+            });
+            res.json({ data: updated, imagenStatus: status });
+            return;
+          }
+        }
+      }
+
+      res.json({ data: generation, imagenStatus: status });
+      return;
+    }
     
     if (isKlingModel) {
-      // Determine task type from generation type
       const taskType = generation.generationType === "motion-control" 
         ? "motion-control" 
         : generation.generationType === "video-to-video"
@@ -440,14 +581,12 @@ router.post("/:id/check-status", async (req, res, next) => {
         ? "image2image"
         : "text2video";
 
-      // Check status from KLing API
       const status = await klingService.checkGenerationStatus(generation.providerJobId, taskType, generation.modelName);
 
       if (status.data.task_status === "succeed") {
         const isImageTask = generation.generationType === "text-to-image" || generation.generationType === "image-to-image";
         
         if (isImageTask) {
-          // Handle image generation results
           const imageUrl = status.data.task_result?.images?.[0]?.url;
           
           if (imageUrl) {
@@ -480,9 +619,8 @@ router.post("/:id/check-status", async (req, res, next) => {
             }
           }
         } else {
-          // Handle video generation results
           const videoUrl = status.data.task_result?.videos?.[0]?.url;
-          const thumbnailUrl = status.data.task_result?.videos?.[0]?.cover_url; // Extract cover_url from Kling API
+          const thumbnailUrl = status.data.task_result?.videos?.[0]?.cover_url;
 
           if (videoUrl) {
             try {
@@ -536,10 +674,8 @@ router.post("/:id/check-status", async (req, res, next) => {
       return;
     }
 
-    // Check status from Veo 3 API
     const status = await veo3Service.checkGenerationStatus(generation.providerJobId);
 
-    // If done, update the database
     if (status.done) {
       if (status.error) {
         await prisma.generation.update({
@@ -601,9 +737,6 @@ router.post("/:id/check-status", async (req, res, next) => {
   }
 });
 
-/**
- * Trigger check for all pending generations
- */
 router.post("/check-all-pending", async (req, res, next) => {
   try {
     checkPendingGenerations().catch(() => {});
@@ -617,9 +750,6 @@ router.post("/check-all-pending", async (req, res, next) => {
   }
 });
 
-/**
- * Background process to handle Veo 3 video generation
- */
 async function processVeo3Generation(
   generationId: string,
   params: {
@@ -640,9 +770,7 @@ async function processVeo3Generation(
 
     let veo3Response;
 
-    // Veo 3 currently supports text-to-video and image-to-video
     if (params.generationType === "image-to-video" && params.inputImageUrl) {
-      // Image-to-Video
       veo3Response = await veo3Service.generateImageToVideo({
         imageUrl: params.inputImageUrl,
         prompt: params.prompt,
@@ -652,7 +780,6 @@ async function processVeo3Generation(
         modelName: params.modelName
       });
     } else {
-      // Text-to-Video (default)
       if (!params.prompt) {
         throw new Error("Prompt is required for text-to-video generation");
       }
@@ -745,9 +872,6 @@ async function processVeo3Generation(
   }
 }
 
-/**
- * Poll Veo 3 API for generation completion
- */
 async function pollVeo3Generation(generationId: string, operationName: string) {
   const maxAttempts = 120;
   const intervalMs = 10000;
@@ -849,9 +973,6 @@ async function pollVeo3Generation(generationId: string, operationName: string) {
   });
 }
 
-/**
- * Background process to handle KLing video generation
- */
 async function processKlingGeneration(
   generationId: string,
   params: {
@@ -872,18 +993,9 @@ async function processKlingGeneration(
   }
 ) {
   try {
-    console.log('🔄 Processing Kling generation:', {
-      generationId,
-      generationType: params.generationType,
-      modelName: params.modelName,
-      aspectRatio: params.aspectRatio
-    });
-
     let klingResponse;
 
-    // KLing supports text-to-video, image-to-video, video-to-video, motion-control, text-to-image, and image-to-image
     if (params.generationType === "motion-control" && params.inputVideoUrl && params.characterImageUrl) {
-      // Motion Control
       klingResponse = await klingService.generateMotionControl({
         videoUrl: params.inputVideoUrl,
         characterImageUrl: params.characterImageUrl,
@@ -894,7 +1006,6 @@ async function processKlingGeneration(
         characterOrientation: params.characterOrientation
       });
     } else if (params.generationType === "video-to-video" && params.inputVideoUrl) {
-      // Video-to-Video
       klingResponse = await klingService.generateVideoToVideo({
         videoUrl: params.inputVideoUrl,
         prompt: params.prompt,
@@ -904,7 +1015,6 @@ async function processKlingGeneration(
         modelName: params.modelName
       });
     } else if (params.generationType === "image-to-video" && params.inputImageUrl) {
-      // Image-to-Video
       klingResponse = await klingService.generateImageToVideo({
         imageUrl: params.inputImageUrl,
         prompt: params.prompt,
@@ -914,7 +1024,6 @@ async function processKlingGeneration(
         modelName: params.modelName
       });
     } else if (params.generationType === "image-to-image" && params.inputImageUrl) {
-      // Image-to-Image
       if (!params.prompt) {
         throw new Error("Prompt is required for image-to-image generation");
       }
@@ -926,8 +1035,6 @@ async function processKlingGeneration(
         modelName: params.modelName
       });
     } else if (params.generationType === "text-to-image") {
-      // Text-to-Image
-      console.log('🎨 Generating text-to-image with Kling');
       if (!params.prompt) {
         throw new Error("Prompt is required for text-to-image generation");
       }
@@ -936,9 +1043,7 @@ async function processKlingGeneration(
         aspectRatio: params.aspectRatio,
         modelName: params.modelName
       });
-      console.log('✅ Kling text-to-image response:', klingResponse);
     } else {
-      // Text-to-Video (default)
       if (!params.prompt) {
         throw new Error("Prompt is required for text-to-video generation");
       }
@@ -978,8 +1083,6 @@ async function processKlingGeneration(
       throw new Error("KLing API returned unexpected response format");
     }
   } catch (error: any) {
-
-    // Parse error to extract code and message
     let errorCode = "UNKNOWN_ERROR";
     let errorMessage = error.message || "Unknown error occurred";
 
@@ -1011,9 +1114,6 @@ async function processKlingGeneration(
   }
 }
 
-/**
- * Poll KLing API for generation completion
- */
 async function pollKlingGeneration(generationId: string, klingGenerationId: string, taskType: "text2video" | "image2video" | "video2video" | "motion-control" | "text2image" | "image2image" = "text2video", modelName?: string) {
   const maxAttempts = 120;
   const intervalMs = 10000;
@@ -1028,7 +1128,6 @@ async function pollKlingGeneration(generationId: string, klingGenerationId: stri
         const isImageTask = taskType === "text2image" || taskType === "image2image";
         
         if (isImageTask) {
-          // Handle image generation results
           const imageUrl = status.data.task_result?.images?.[0]?.url;
           
           if (imageUrl) {
@@ -1063,9 +1162,8 @@ async function pollKlingGeneration(generationId: string, klingGenerationId: stri
             throw new Error("KLing completed but no image URL found");
           }
         } else {
-          // Handle video generation results
           const videoUrl = status.data.task_result?.videos?.[0]?.url;
-          const thumbnailUrl = status.data.task_result?.videos?.[0]?.cover_url; // Extract cover_url from Kling API
+          const thumbnailUrl = status.data.task_result?.videos?.[0]?.cover_url;
 
           if (videoUrl) {
             try {
@@ -1150,9 +1248,360 @@ async function pollKlingGeneration(generationId: string, klingGenerationId: stri
   });
 }
 
-/**
- * Proxy endpoint to serve videos from Google API with authentication
- */
+async function processImagenGeneration(
+  generationId: string,
+  params: {
+    prompt?: string;
+    modelName: string;
+    aspectRatio: string;
+    generationType: string;
+    inputImageUrl?: string;
+    imageStrength?: number;
+  }
+) {
+  try {
+    let imagenResponse;
+
+    if (params.generationType === "image-to-image" && params.inputImageUrl) {
+      if (!params.prompt) {
+        throw new Error("Prompt is required for image-to-image generation");
+      }
+      imagenResponse = await imagenService.generateImageToImage({
+        imageUrl: params.inputImageUrl,
+        prompt: params.prompt,
+        aspectRatio: params.aspectRatio,
+        strength: params.imageStrength,
+        modelName: params.modelName
+      });
+    } else if (params.generationType === "text-to-image") {
+      if (!params.prompt) {
+        throw new Error("Prompt is required for text-to-image generation");
+      }
+      imagenResponse = await imagenService.generateTextToImage({
+        prompt: params.prompt,
+        aspectRatio: params.aspectRatio,
+        modelName: params.modelName
+      });
+    } else {
+      throw new Error("Unsupported generation type for Imagen");
+    }
+
+    // Check if response contains immediate result (predictions)
+    const imageUrl = imagenService.extractImageUrl(imagenResponse);
+    
+    if (imageUrl) {
+      // Immediate result - save directly
+      if (imageUrl.startsWith('data:')) {
+        // Convert base64 data URI to file and upload to Cloudinary
+        const base64Data = imageUrl.split(',')[1];
+        const buffer = Buffer.from(base64Data, 'base64');
+        const filename = `imagen-${Date.now()}.png`;
+        const fs = await import('fs/promises');
+        const path = await import('path');
+        const uploadsDir = path.join(process.cwd(), 'uploads');
+        await fs.mkdir(uploadsDir, { recursive: true });
+        const filepath = path.join(uploadsDir, filename);
+        await fs.writeFile(filepath, buffer);
+        
+        const cloudinaryImageUrl = await uploadLocalFileToCloudinary(filename, 'image');
+        
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "completed",
+            imageUrl: cloudinaryImageUrl,
+            thumbnailUrl: cloudinaryImageUrl,
+            providerJobId: imagenResponse.name || undefined,
+            updatedAt: new Date()
+          } as any
+        });
+      } else {
+        // URL result
+        const imageFilename = await downloadAndSaveThumbnail(imageUrl, process.env.GOOGLE_API_KEY);
+        const cloudinaryImageUrl = await uploadLocalFileToCloudinary(imageFilename, 'image');
+        
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "completed",
+            imageUrl: cloudinaryImageUrl,
+            thumbnailUrl: cloudinaryImageUrl,
+            providerJobId: imagenResponse.name || undefined,
+            updatedAt: new Date()
+          } as any
+        });
+      }
+    } else if (imagenResponse.name && !imagenResponse.done) {
+      // Long-running operation - needs polling
+      await prisma.generation.update({
+        where: { id: generationId },
+        data: {
+          providerJobId: imagenResponse.name,
+          status: "in_progress"
+        }
+      });
+
+      pollImagenGeneration(generationId, imagenResponse.name).catch(() => {});
+    } else {
+      throw new Error("Imagen API returned unexpected response format");
+    }
+  } catch (error: any) {
+    let errorCode = "UNKNOWN_ERROR";
+    let errorMessage = error.message || "Unknown error occurred";
+
+    if (error.message?.includes("quota") || error.message?.includes("RESOURCE_EXHAUSTED")) {
+      errorCode = "QUOTA_EXCEEDED";
+      errorMessage = "API quota exceeded. Please check your billing plan or try again later.";
+    } else if (error.message?.includes("authentication") || error.message?.includes("unauthorized")) {
+      errorCode = "AUTH_ERROR";
+      errorMessage = "Authentication failed. Please check your API key.";
+    } else if (error.message?.includes("timeout")) {
+      errorCode = "TIMEOUT";
+      errorMessage = "Request timed out. Please try again.";
+    } else if (error.message?.includes("invalid") || error.message?.includes("bad request")) {
+      errorCode = "INVALID_REQUEST";
+      errorMessage = "Invalid request parameters.";
+    }
+
+    await prisma.generation.update({
+      where: { id: generationId },
+      data: {
+        status: "failed",
+        errorCode,
+        errorMessage,
+        updatedAt: new Date()
+      }
+    });
+  }
+}
+
+async function processGeminiGeneration(
+  generationId: string,
+  params: {
+    prompt?: string;
+    modelName: string;
+    aspectRatio: string;
+    generationType: string;
+    inputImageUrl?: string;
+  }
+) {
+  try {
+    let geminiResponse;
+
+    if (params.generationType === "image-to-image" && params.inputImageUrl) {
+      if (!params.prompt) {
+        throw new Error("Prompt is required for image-to-image generation");
+      }
+      geminiResponse = await geminiImageService.generateImageToImage({
+        imageUrl: params.inputImageUrl,
+        prompt: params.prompt,
+        aspectRatio: params.aspectRatio,
+        modelName: params.modelName
+      });
+    } else if (params.generationType === "text-to-image") {
+      if (!params.prompt) {
+        throw new Error("Prompt is required for text-to-image generation");
+      }
+      geminiResponse = await geminiImageService.generateTextToImage({
+        prompt: params.prompt,
+        aspectRatio: params.aspectRatio,
+        modelName: params.modelName
+      });
+    } else {
+      throw new Error("Unsupported generation type for Gemini");
+    }
+
+    // Extract image URL from response
+    const imageUrl = geminiImageService.extractImageUrl(geminiResponse);
+    
+    if (imageUrl) {
+      // Convert base64 data URI to file and upload to Cloudinary
+      if (imageUrl.startsWith('data:')) {
+        const base64Data = imageUrl.split(',')[1];
+        const buffer = Buffer.from(base64Data, 'base64');
+        const filename = `gemini-${Date.now()}.png`;
+        const fs = await import('fs/promises');
+        const path = await import('path');
+        const uploadsDir = path.join(process.cwd(), 'uploads');
+        await fs.mkdir(uploadsDir, { recursive: true });
+        const filepath = path.join(uploadsDir, filename);
+        await fs.writeFile(filepath, buffer);
+        
+        const cloudinaryImageUrl = await uploadLocalFileToCloudinary(filename, 'image');
+        
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "completed",
+            imageUrl: cloudinaryImageUrl,
+            thumbnailUrl: cloudinaryImageUrl,
+            updatedAt: new Date()
+          } as any
+        });
+      } else {
+        // URL result (unlikely for Gemini)
+        const imageFilename = await downloadAndSaveThumbnail(imageUrl, process.env.GOOGLE_API_KEY);
+        const cloudinaryImageUrl = await uploadLocalFileToCloudinary(imageFilename, 'image');
+        
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "completed",
+            imageUrl: cloudinaryImageUrl,
+            thumbnailUrl: cloudinaryImageUrl,
+            updatedAt: new Date()
+          } as any
+        });
+      }
+    } else {
+      throw new Error("Gemini API returned no image data");
+    }
+  } catch (error: any) {
+    let errorCode = "UNKNOWN_ERROR";
+    let errorMessage = error.message || "Unknown error occurred";
+
+    if (error.message?.includes("API key not valid")) {
+      errorCode = "INVALID_API_KEY";
+      errorMessage = "Google API key is invalid or expired";
+    } else if (error.message?.includes("quota")) {
+      errorCode = "QUOTA_EXCEEDED";
+      errorMessage = "API quota exceeded";
+    } else if (error.message?.includes("timeout")) {
+      errorCode = "TIMEOUT";
+      errorMessage = "Request timed out";
+    }
+
+    console.error(`❌ Gemini generation failed for ${generationId}:`, errorMessage);
+
+    await prisma.generation.update({
+      where: { id: generationId },
+      data: {
+        status: "failed",
+        errorCode,
+        errorMessage,
+        updatedAt: new Date()
+      } as any
+    });
+  }
+}
+
+async function pollImagenGeneration(generationId: string, operationName: string) {
+  const maxAttempts = 60;
+  const intervalMs = 5000;
+
+  let attempts = 0;
+
+  while (attempts < maxAttempts) {
+    try {
+      const status = await imagenService.checkGenerationStatus(operationName);
+
+      if (status.done) {
+        if (status.error) {
+          let errorCode = "GENERATION_FAILED";
+          let errorMessage = status.error.message || "Image generation failed";
+          
+          await prisma.generation.update({
+            where: { id: generationId },
+            data: {
+              status: "failed",
+              errorCode,
+              errorMessage,
+              updatedAt: new Date()
+            }
+          });
+          return;
+        }
+
+        const imageUrl = imagenService.extractImageUrl(status);
+
+        if (imageUrl) {
+          try {
+            let cloudinaryImageUrl: string;
+            
+            if (imageUrl.startsWith('data:')) {
+              // Convert base64 data URI to file and upload
+              const base64Data = imageUrl.split(',')[1];
+              const buffer = Buffer.from(base64Data, 'base64');
+              const filename = `imagen-${Date.now()}.png`;
+              const fs = await import('fs/promises');
+              const path = await import('path');
+              const uploadsDir = path.join(process.cwd(), 'uploads');
+              await fs.mkdir(uploadsDir, { recursive: true });
+              const filepath = path.join(uploadsDir, filename);
+              await fs.writeFile(filepath, buffer);
+              
+              cloudinaryImageUrl = await uploadLocalFileToCloudinary(filename, 'image');
+            } else {
+              // Download from URL
+              const imageFilename = await downloadAndSaveThumbnail(imageUrl, process.env.GOOGLE_API_KEY);
+              cloudinaryImageUrl = await uploadLocalFileToCloudinary(imageFilename, 'image');
+            }
+            
+            await prisma.generation.update({
+              where: { id: generationId },
+              data: {
+                status: "completed",
+                imageUrl: cloudinaryImageUrl,
+                thumbnailUrl: cloudinaryImageUrl,
+                updatedAt: new Date()
+              } as any
+            });
+
+            return;
+          } catch (downloadError: any) {
+            await prisma.generation.update({
+              where: { id: generationId },
+              data: {
+                status: "failed",
+                errorMessage: `Failed to upload image to Cloudinary: ${downloadError.message}`,
+                updatedAt: new Date()
+              }
+            });
+            return;
+          }
+        } else {
+          throw new Error("Imagen completed but no image URL found");
+        }
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      attempts++;
+    } catch (error: any) {
+      attempts++;
+
+      if (attempts >= 3 && error.message?.includes("API error")) {
+        let errorCode = "POLLING_ERROR";
+        let errorMessage = error.message || "Failed to check generation status";
+        
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "failed",
+            errorCode,
+            errorMessage,
+            updatedAt: new Date()
+          }
+        });
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  const errorCode = "TIMEOUT";
+  const errorMessage = "Generation timed out after maximum polling attempts";
+  await prisma.generation.update({
+    where: { id: generationId },
+    data: {
+      status: "failed",
+      errorCode,
+      errorMessage,
+      updatedAt: new Date()
+    }
+  });
+}
+
 router.get("/:id/video", async (req, res, next) => {
   try {
     const generation = await prisma.generation.findUnique({
@@ -1170,8 +1619,6 @@ router.get("/:id/video", async (req, res, next) => {
     }
 
     if (generation.videoUrl.includes("generativelanguage.googleapis.com")) {
-
-      // Download video from Google API with authentication
       const response = await axios.get(generation.videoUrl, {
         responseType: "stream",
         headers: {
@@ -1179,18 +1626,14 @@ router.get("/:id/video", async (req, res, next) => {
         }
       });
 
-      // Set appropriate headers
       res.setHeader("Content-Type", response.headers["content-type"] || "video/mp4");
       if (response.headers["content-length"]) {
         res.setHeader("Content-Length", response.headers["content-length"]);
       }
       res.setHeader("Accept-Ranges", "bytes");
-      res.setHeader("Cache-Control", "public, max-age=31536000"); // Cache for 1 year
-
-      // Stream the video to the client
+      res.setHeader("Cache-Control", "public, max-age=31536000");
       response.data.pipe(res);
     } else {
-      // If it's already a local URL, redirect to it
       res.redirect(generation.videoUrl);
     }
   } catch (error: any) {
@@ -1198,9 +1641,6 @@ router.get("/:id/video", async (req, res, next) => {
   }
 });
 
-/**
- * Proxy endpoint to serve thumbnails from Google API with authentication
- */
 router.get("/:id/thumbnail", async (req, res, next) => {
   try {
     const generation = await prisma.generation.findUnique({
@@ -1218,8 +1658,6 @@ router.get("/:id/thumbnail", async (req, res, next) => {
     }
 
     if (generation.thumbnailUrl.includes("generativelanguage.googleapis.com")) {
-
-      // Download thumbnail from Google API with authentication
       const response = await axios.get(generation.thumbnailUrl, {
         responseType: "stream",
         headers: {
@@ -1227,20 +1665,392 @@ router.get("/:id/thumbnail", async (req, res, next) => {
         }
       });
 
-      // Set appropriate headers
       res.setHeader("Content-Type", response.headers["content-type"] || "image/jpeg");
       if (response.headers["content-length"]) {
         res.setHeader("Content-Length", response.headers["content-length"]);
       }
-      res.setHeader("Cache-Control", "public, max-age=31536000"); // Cache for 1 year
-
-      // Stream the image to the client
+      res.setHeader("Cache-Control", "public, max-age=31536000");
       response.data.pipe(res);
     } else {
-      // If it's already a local URL, redirect to it
       res.redirect(generation.thumbnailUrl);
     }
   } catch (error: any) {
+    next(error);
+  }
+});
+
+const constructionStagesSchema = z.object({
+  inputImageUrl: z.string().url().optional(),
+  modelName: z.string().optional().default("Nano Banana"),
+  aspectRatio: z.string().optional().default("16:9"),
+  basePrompt: z.string().optional()
+});
+
+async function waitForImageGeneration(
+  generationId: string,
+  klingGenerationId: string,
+  modelName?: string,
+  maxAttempts: number = 120,
+  intervalMs: number = 10000
+): Promise<{ imageUrl: string; success: boolean; error?: string }> {
+  let attempts = 0;
+
+  while (attempts < maxAttempts) {
+    try {
+      const status = await klingService.checkGenerationStatus(klingGenerationId, "image2image", modelName);
+
+      if (status.data.task_status === "succeed") {
+        const imageUrl = status.data.task_result?.images?.[0]?.url;
+
+        if (imageUrl) {
+          try {
+            const imageFilename = await downloadAndSaveThumbnail(imageUrl, undefined);
+            const cloudinaryImageUrl = await uploadLocalFileToCloudinary(imageFilename, 'image');
+
+            await prisma.generation.update({
+              where: { id: generationId },
+              data: {
+                status: "completed",
+                imageUrl: cloudinaryImageUrl,
+                thumbnailUrl: cloudinaryImageUrl,
+                updatedAt: new Date()
+              } as any
+            });
+
+            return { imageUrl: cloudinaryImageUrl, success: true };
+          } catch (downloadError: any) {
+            await prisma.generation.update({
+              where: { id: generationId },
+              data: {
+                status: "failed",
+                errorMessage: `Failed to upload image to Cloudinary: ${downloadError.message}`,
+                updatedAt: new Date()
+              }
+            });
+            return { imageUrl: "", success: false, error: downloadError.message };
+          }
+        } else {
+          throw new Error("Kling completed but no image URL found");
+        }
+      } else if (status.data.task_status === "failed") {
+        const errorMessage = status.data.task_status_msg || "Kling generation failed";
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "failed",
+            errorCode: "GENERATION_FAILED",
+            errorMessage,
+            updatedAt: new Date()
+          }
+        });
+        return { imageUrl: "", success: false, error: errorMessage };
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      attempts++;
+    } catch (error: any) {
+      attempts++;
+
+      if (attempts >= 3 && error.message?.includes("API error")) {
+        const errorMessage = error.message || "Failed to check generation status";
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "failed",
+            errorCode: "POLLING_ERROR",
+            errorMessage,
+            updatedAt: new Date()
+          }
+        });
+        return { imageUrl: "", success: false, error: errorMessage };
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  const errorMessage = "Generation timed out after maximum polling attempts";
+  await prisma.generation.update({
+    where: { id: generationId },
+    data: {
+      status: "failed",
+      errorCode: "TIMEOUT",
+      errorMessage,
+      updatedAt: new Date()
+    }
+  });
+  return { imageUrl: "", success: false, error: errorMessage };
+}
+
+router.post("/construction-stages", upload.fields([{ name: "image", maxCount: 1 }]), async (req, res, next) => {
+  try {
+    const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
+    const imageFile = files?.image?.[0];
+    
+    let parsed;
+    try {
+      parsed = constructionStagesSchema.parse(req.body);
+    } catch (validationError: any) {
+      if (!imageFile) {
+        if (validationError.errors) {
+          return res.status(400).json({
+            success: false,
+            error: "Validation failed",
+            details: validationError.errors.map((err: any) => ({
+              path: err.path.join('.'),
+              message: err.message
+            }))
+          });
+        }
+        throw validationError;
+      }
+      parsed = { modelName: "Nano Banana", aspectRatio: "16:9" };
+    }
+    
+    const { inputImageUrl: providedImageUrl, modelName, aspectRatio, basePrompt } = parsed;
+
+    let inputImageUrl: string;
+    
+    if (providedImageUrl) {
+      inputImageUrl = providedImageUrl;
+    } else if (imageFile) {
+      inputImageUrl = await uploadLocalFileToCloudinary(imageFile.filename, 'image');
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: "Either inputImageUrl or image file is required"
+      });
+    }
+
+    // Check which service to use based on model name
+    const lowerModelName = modelName?.toLowerCase() || '';
+    const isNanoBananaModel = lowerModelName.includes('nano banana');
+    const isKlingModel = lowerModelName.includes('kling');
+    
+    if (isNanoBananaModel && !geminiImageService.isConfigured()) {
+      return res.status(500).json({
+        success: false,
+        error: "Gemini Image service is not configured. Please check your Google API key."
+      });
+    }
+    
+    if (isKlingModel && !klingService.isConfigured()) {
+      return res.status(500).json({
+        success: false,
+        error: "Kling AI service is not configured. Please check your API credentials."
+      });
+    }
+
+    const stages = getAllStages();
+    const results: Array<{
+      stageKey: string;
+      stageOrder: number;
+      prompt: string;
+      imageUrl: string;
+      generationId: string;
+      success: boolean;
+      error?: string;
+    }> = [];
+
+    let currentImageUrl = inputImageUrl;
+    let parentGenerationId: string | undefined = undefined;
+
+    for (const stage of stages) {
+      try {
+        const fullPrompt = buildStagePrompt(stage, basePrompt);
+
+        if (stage.stageOrder === 1) {
+          const generationId = randomUUID();
+          await prisma.generation.create({
+            data: {
+              id: generationId,
+              prompt: fullPrompt,
+              modelName: modelName || "Nano Banana",
+              duration: "0s",
+              aspectRatio: aspectRatio || "16:9",
+              resolution: "720p",
+              audioEnabled: false,
+              feature: "image-to-image",
+              generationType: "image-to-image",
+              status: "completed",
+              inputImageUrl: currentImageUrl,
+              imageUrl: currentImageUrl,
+              updatedAt: new Date()
+            } as any
+          });
+          
+          const stageResult = {
+            stageKey: stage.stageKey,
+            stageOrder: stage.stageOrder,
+            prompt: fullPrompt,
+            imageUrl: currentImageUrl,
+            generationId: generationId,
+            success: true
+          };
+
+          results.push(stageResult);
+          continue;
+        }
+
+        const generationId = randomUUID();
+        const generation = await prisma.generation.create({
+          data: {
+            id: generationId,
+            prompt: fullPrompt,
+            modelName: modelName || "Nano Banana",
+            duration: "0s",
+            aspectRatio: aspectRatio || "16:9",
+            resolution: "720p",
+            audioEnabled: false,
+            feature: "image-to-image",
+            generationType: "image-to-image",
+            status: "in_progress",
+            inputImageUrl: currentImageUrl,
+            updatedAt: new Date()
+          } as any
+        });
+
+        let result: { imageUrl: string; success: boolean; error?: string };
+
+        if (isNanoBananaModel) {
+          // Use Gemini service for Nano Banana model
+          try {
+            const geminiResponse = await geminiImageService.generateImageToImage({
+              imageUrl: currentImageUrl,
+              prompt: fullPrompt,
+              aspectRatio: aspectRatio || "16:9",
+              modelName: modelName || "Nano Banana"
+            });
+
+            const imageUrl = geminiImageService.extractImageUrl(geminiResponse);
+            
+            if (imageUrl && imageUrl.startsWith('data:')) {
+              // Convert base64 data URI to file and upload
+              const base64Data = imageUrl.split(',')[1];
+              const buffer = Buffer.from(base64Data, 'base64');
+              const filename = `gemini-${Date.now()}.png`;
+              const fs = await import('fs/promises');
+              const path = await import('path');
+              const uploadsDir = path.join(process.cwd(), 'uploads');
+              await fs.mkdir(uploadsDir, { recursive: true });
+              const filepath = path.join(uploadsDir, filename);
+              await fs.writeFile(filepath, buffer);
+              
+              const cloudinaryImageUrl = await uploadLocalFileToCloudinary(filename, 'image');
+              
+              await prisma.generation.update({
+                where: { id: generationId },
+                data: {
+                  status: "completed",
+                  imageUrl: cloudinaryImageUrl,
+                  thumbnailUrl: cloudinaryImageUrl,
+                  updatedAt: new Date()
+                } as any
+              });
+
+              result = { imageUrl: cloudinaryImageUrl, success: true };
+            } else {
+              throw new Error("Gemini API did not return image data");
+            }
+          } catch (geminiError: any) {
+            await prisma.generation.update({
+              where: { id: generationId },
+              data: {
+                status: "failed",
+                errorMessage: geminiError.message,
+                updatedAt: new Date()
+              }
+            });
+            result = { imageUrl: "", success: false, error: geminiError.message };
+          }
+        } else {
+          // Use Kling service for Kling models
+          const klingResponse = await klingService.generateImageToImage({
+            imageUrl: currentImageUrl,
+            prompt: fullPrompt,
+            aspectRatio: aspectRatio || "16:9",
+            strength: stage.strength,
+            modelName: modelName || "Nano Banana"
+          });
+
+          if (!klingResponse.data?.task_id) {
+            throw new Error("Kling API returned unexpected response format");
+          }
+
+          // Update generation with provider job ID
+          await prisma.generation.update({
+            where: { id: generationId },
+            data: {
+              providerJobId: klingResponse.data.task_id,
+              status: "in_progress"
+            }
+          });
+
+          result = await waitForImageGeneration(
+            generationId,
+            klingResponse.data.task_id,
+            modelName || "Nano Banana"
+          );
+        }
+
+        if (result.success && result.imageUrl) {
+          currentImageUrl = result.imageUrl;
+          parentGenerationId = generationId;
+
+          results.push({
+            stageKey: stage.stageKey,
+            stageOrder: stage.stageOrder,
+            prompt: fullPrompt,
+            imageUrl: result.imageUrl,
+            generationId: generationId,
+            success: true
+          });
+        } else {
+          results.push({
+            stageKey: stage.stageKey,
+            stageOrder: stage.stageOrder,
+            prompt: fullPrompt,
+            imageUrl: "",
+            generationId: generationId,
+            success: false,
+            error: result.error || "Unknown error"
+          });
+
+          return res.status(207).json({
+            success: false,
+            message: `Generation stopped at stage ${stage.stageOrder}. Some stages completed successfully.`,
+            stages: results,
+            failedAtStage: stage.stageOrder
+          });
+        }
+      } catch (error: any) {
+        return res.status(207).json({
+          success: false,
+          message: `Error at stage ${stage.stageOrder}: ${error.message}`,
+          stages: results,
+          failedAtStage: stage.stageOrder,
+          error: error.message
+        });
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "All construction stages generated successfully",
+      stages: results
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        success: false,
+        error: "Validation failed",
+        details: error.errors.map(err => ({
+          path: err.path.join('.'),
+          message: err.message
+        }))
+      });
+    }
+
     next(error);
   }
 });

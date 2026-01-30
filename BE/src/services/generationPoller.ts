@@ -1,6 +1,7 @@
 import prisma from "../prisma";
 import { veo3Service } from "./veo3Service";
 import { klingService } from "./klingService";
+import { imagenService } from "./imagenService";
 import { tiktokService } from "./tiktokService";
 import { downloadAndSaveVideo, downloadAndSaveThumbnail, generateVideoThumbnail } from "../utils/storage";
 import { uploadLocalFileToCloudinary } from "./cloudinaryService";
@@ -20,6 +21,15 @@ const activePolls = new Set<string>(); // Track which generations are currently 
  */
 function isKlingModel(modelName: string | null): boolean {
   return modelName?.toLowerCase().includes('kling') ?? false;
+}
+
+/**
+ * Determine if a generation is using Imagen based on model name
+ */
+function isImagenModel(modelName: string | null): boolean {
+  if (!modelName) return false;
+  const lowerName = modelName.toLowerCase();
+  return lowerName.includes('imagen');
 }
 
 /**
@@ -326,6 +336,83 @@ async function pollVeo3Generation(generationId: string, operationName: string) {
 }
 
 /**
+ * Poll a single Imagen generation
+ */
+async function pollImagenGeneration(generationId: string, operationName: string) {
+  try {
+    const status = await imagenService.checkGenerationStatus(operationName);
+
+    if (status.done) {
+      if (status.error) {
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "failed",
+            updatedAt: new Date()
+          }
+        });
+      } else {
+        const imageUrl = imagenService.extractImageUrl(status);
+
+        if (imageUrl) {
+          try {
+            let cloudinaryImageUrl: string;
+            
+            if (imageUrl.startsWith('data:')) {
+              // Convert base64 data URI to file and upload
+              const base64Data = imageUrl.split(',')[1];
+              const buffer = Buffer.from(base64Data, 'base64');
+              const filename = `imagen-${Date.now()}.png`;
+              const fs = await import('fs/promises');
+              const uploadsDir = path.join(process.cwd(), 'uploads');
+              await fs.mkdir(uploadsDir, { recursive: true });
+              const filepath = path.join(uploadsDir, filename);
+              await fs.writeFile(filepath, buffer);
+              
+              cloudinaryImageUrl = await uploadLocalFileToCloudinary(filename, 'image');
+            } else {
+              // Download from URL
+              const imageFilename = await downloadAndSaveThumbnail(imageUrl, process.env.GOOGLE_API_KEY);
+              cloudinaryImageUrl = await uploadLocalFileToCloudinary(imageFilename, 'image');
+            }
+            
+            await prisma.generation.update({
+              where: { id: generationId },
+              data: {
+                status: "completed",
+                imageUrl: cloudinaryImageUrl,
+                thumbnailUrl: cloudinaryImageUrl,
+                updatedAt: new Date()
+              } as any
+            });
+          } catch (downloadError: any) {
+            await prisma.generation.update({
+              where: { id: generationId },
+              data: {
+                status: "failed",
+                errorMessage: `Failed to upload image to Cloudinary: ${downloadError.message}`,
+                updatedAt: new Date()
+              }
+            });
+          }
+        } else {
+          await prisma.generation.update({
+            where: { id: generationId },
+            data: {
+              status: "failed",
+              errorMessage: "No image URL returned from provider",
+              updatedAt: new Date()
+            }
+          });
+        }
+      }
+    }
+  } catch (error: any) {
+    throw error;
+  }
+}
+
+/**
  * Poll a single generation (routes to appropriate provider)
  */
 async function pollGeneration(generationId: string, operationName: string, modelName: string | null, generationType: string) {
@@ -336,7 +423,9 @@ async function pollGeneration(generationId: string, operationName: string, model
   activePolls.add(generationId);
 
   try {
-    if (isKlingModel(modelName)) {
+    if (isImagenModel(modelName)) {
+      await pollImagenGeneration(generationId, operationName);
+    } else if (isKlingModel(modelName)) {
       await pollKlingGeneration(generationId, operationName, generationType);
     } else {
       await pollVeo3Generation(generationId, operationName);

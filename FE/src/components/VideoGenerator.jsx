@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Image, Video, Zap, History, Info, ChevronRight, Upload, Trash2, Settings } from 'lucide-react';
+import { Play, Image, Video, Zap, History, Info, ChevronRight, Upload, Trash2, Settings, X } from 'lucide-react';
 import VideoModelSelector from './VideoModelSelector';
 import TikTokSettings from './TikTokSettings';
 
@@ -46,6 +46,8 @@ const FEATURE_LABELS = {
   'edit': { name: 'Edit Video', color: 'bg-orange-500' },
   'motion': { name: 'Motion Control', color: 'bg-pink-500' },
   'video-to-video': { name: 'Video to Video', color: 'bg-green-500' },
+  'text-to-image': { name: 'Text to Image', color: 'bg-indigo-500' },
+  'image-to-image': { name: 'Image to Image', color: 'bg-teal-500' },
 };
 
 const VideoGenerator = () => {
@@ -73,18 +75,71 @@ const VideoGenerator = () => {
   const [showDurationDropdown, setShowDurationDropdown] = useState(false);
   const [showRatioDropdown, setShowRatioDropdown] = useState(false);
   const [showResolutionDropdown, setShowResolutionDropdown] = useState(false);
-  const [deleteConfirmation, setDeleteConfirmation] = useState({ show: false, videoId: null });
+  const [deleteConfirmation, setDeleteConfirmation] = useState({ show: false, videoId: null, videoIds: null });
   const [historyVideoModal, setHistoryVideoModal] = useState({ show: false, video: null });
   const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'list'
   const [showTikTokSettings, setShowTikTokSettings] = useState(false);
   const [tiktokUploadModal, setTiktokUploadModal] = useState({ show: false, video: null });
   const [tiktokConnected, setTiktokConnected] = useState(false);
   const [isUploadingToTiktok, setIsUploadingToTiktok] = useState(false);
+  const [imageZoomModal, setImageZoomModal] = useState({ show: false, imageUrl: null });
+  
+  // Bulk selection states
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedVideoIds, setSelectedVideoIds] = useState([]);
+  
+  // Construction stages states
+  const [isGeneratingStages, setIsGeneratingStages] = useState(false);
+  const [constructionStages, setConstructionStages] = useState(null); // { stages: [...], success: boolean }
+  const [stagesProgress, setStagesProgress] = useState({}); // { stageKey: 'in_progress' | 'completed' | 'failed' }
   
   // Timer states
   const [generationTimer, setGenerationTimer] = useState(null);
   const [elapsedTime, setElapsedTime] = useState(0);
   const timerIntervalRef = useRef(null);
+
+  // Detect generation type based on prompt and uploads
+  const detectGenerationType = () => {
+    if (motionControlEnabled) return 'motion-control';
+    if (uploadedVideoFile) return 'video-to-video';
+    if (activeTab === 'text-to-image') {
+      // In text-to-image tab: if image uploaded, switch to image-to-image
+      if (uploadedImageFile) return 'image-to-image';
+      return 'text-to-image';
+    }
+    if (activeTab === 'image-to-image' && uploadedImageFile) return 'image-to-image';
+    // In text-to-video tab: handle different modes
+    if (activeTab === 'text-to-video') {
+      // When in text-to-image mode: if start frame uploaded, use image-to-image
+      // Note: endFrameFile is only for Video Generation, not Image Generation
+      if (textMode === 'text-to-image' && startFrameFile) {
+        return 'image-to-image';
+      }
+      // When in text-to-video mode (or default): if image uploaded, switch to image-to-video
+      if ((textMode === 'text-to-video' || !textMode) && uploadedImageFile) {
+        return 'image-to-video';
+      }
+      return textMode || 'text-to-video';
+    }
+    if (uploadedImageFile && activeTab === 'create') return 'image-to-video';
+    return 'text-to-video';
+  };
+
+  // Filter models based on current tab/generation type
+  const filteredModels = React.useMemo(() => {
+    if (!models || models.length === 0) return [];
+    
+    const generationType = detectGenerationType();
+    
+    // Filter models that support the current generation type
+    return models.filter(model => {
+      // If model doesn't have capabilities, show it everywhere (backward compatibility)
+      if (!model.capabilities?.supportedFeatures) return true;
+      
+      // Check if model supports the current generation type
+      return model.capabilities.supportedFeatures.includes(generationType);
+    });
+  }, [models, activeTab, textMode, uploadedImageFile, uploadedVideoFile, motionControlEnabled, startFrameFile]);
 
   // Get current model capabilities
   const currentCapabilities = selectedModel?.capabilities || {
@@ -116,32 +171,6 @@ const VideoGenerator = () => {
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Detect generation type based on prompt and uploads
-  const detectGenerationType = () => {
-    if (motionControlEnabled) return 'motion-control';
-    if (uploadedVideoFile) return 'video-to-video';
-    if (activeTab === 'text-to-image') {
-      // In text-to-image tab: if image uploaded, switch to image-to-image
-      if (uploadedImageFile) return 'image-to-image';
-      return 'text-to-image';
-    }
-    if (activeTab === 'image-to-image' && uploadedImageFile) return 'image-to-image';
-    // In text-to-video tab: handle different modes
-    if (activeTab === 'text-to-video') {
-      // When in text-to-image mode: if start/end frame uploaded, use image-to-image
-      if (textMode === 'text-to-image' && (startFrameFile || endFrameFile)) {
-        return 'image-to-image';
-      }
-      // When in text-to-video mode (or default): if image uploaded, switch to image-to-video
-      if ((textMode === 'text-to-video' || !textMode) && uploadedImageFile) {
-        return 'image-to-video';
-      }
-      return textMode || 'text-to-video';
-    }
-    if (uploadedImageFile && activeTab === 'create') return 'image-to-video';
-    return 'text-to-video';
-  };
-
   // Determine current mode for badge display
   const getCurrentMode = () => {
     if (activeTab === 'text-to-image') {
@@ -165,8 +194,9 @@ const VideoGenerator = () => {
     }
     // In text-to-video tab: handle different modes
     if (activeTab === 'text-to-video') {
-      // When in text-to-image mode: if start/end frame uploaded, switch to image-to-image
-      if (textMode === 'text-to-image' && (startFrameFile || endFrameFile)) {
+      // When in text-to-image mode: if start frame uploaded, switch to image-to-image
+      // Note: endFrameFile is only for Video Generation, not Image Generation
+      if (textMode === 'text-to-image' && startFrameFile) {
         return { type: 'image-to-image', badge: 'Image to Image', color: 'bg-teal-500', description: 'Transform image with AI' };
       }
       if (textMode === 'text-to-image') {
@@ -229,6 +259,40 @@ const VideoGenerator = () => {
       isActive = false;
     };
   }, []);
+
+  // Auto-select first compatible model when generation type changes
+  useEffect(() => {
+    if (!models || models.length === 0) return;
+    
+    const generationType = textMode === 'text-to-image' && activeTab === 'text-to-video' ? 'text-to-image' :
+                          motionControlEnabled ? 'motion-control' :
+                          uploadedVideoFile ? 'video-to-video' :
+                          uploadedImageFile && activeTab === 'text-to-video' ? 'image-to-video' :
+                          activeTab === 'text-to-image' ? 'text-to-image' :
+                          'text-to-video';
+    
+    // Filter compatible models
+    const compatibleModels = models.filter(model => {
+      if (!model.capabilities?.supportedFeatures) return true;
+      return model.capabilities.supportedFeatures.includes(generationType);
+    });
+    
+    if (compatibleModels.length === 0) return;
+    
+    // Use functional setState to access current value without dependency
+    setSelectedModel(currentModel => {
+      // Check if current model is compatible
+      const isCurrentModelCompatible = currentModel && compatibleModels.some(m => m.id === currentModel.id);
+      
+      if (!isCurrentModelCompatible) {
+        // Select first compatible model
+        return compatibleModels[0];
+      }
+      
+      // Keep current model
+      return currentModel;
+    });
+  }, [models, activeTab, textMode, uploadedImageFile, uploadedVideoFile, motionControlEnabled, startFrameFile]);
 
   // Update settings when model changes
   useEffect(() => {
@@ -341,30 +405,29 @@ const VideoGenerator = () => {
     const generationType = detectGenerationType();
 
     if (!selectedModel) {
-      console.error('No model selected. Please select a model first.');
+      alert('⚠️ No model selected. Please select a model first.');
+      return;
+    }
+
+    // Check if model supports the generation type
+    if (selectedModel.capabilities?.supportedFeatures && 
+        !selectedModel.capabilities.supportedFeatures.includes(generationType)) {
+      alert(`⚠️ Model "${selectedModel.name}" does not support ${generationType} generation.\n\nSupported features: ${selectedModel.capabilities.supportedFeatures.join(', ')}`);
       return;
     }
 
     if (!prompt && (generationType === 'text-to-video' || generationType === 'text-to-image' || generationType === 'image-to-image')) {
-      console.warn('Prompt is required for text-to-video/text-to-image/image-to-image generation.');
+      alert('⚠️ Prompt is required for this generation type. Please enter a prompt.');
       return;
     }
     
-    if (!uploadedImageFile && generationType === 'image-to-image') {
-      console.warn('Image is required for image-to-image generation.');
+    // For image-to-image: accept either uploadedImageFile or startFrameFile
+    if (generationType === 'image-to-image' && !uploadedImageFile && !startFrameFile) {
+      alert('⚠️ Image or start frame is required for image-to-image generation. Please upload an image or start frame.');
       return;
     }
     
-    if (generationType === 'text-to-image' && textMode === 'text-to-image' && !startFrameFile) {
-      console.warn('Start frame is required for text-to-image generation.');
-      return;
-    }
-    
-    // Video-to-video works without prompt but it's recommended
-    if (!prompt && generationType === 'video-to-video') {
-      console.warn('Prompt is recommended for video-to-video generation for better results.');
-    }
-
+    // Note: text-to-image does NOT require a start frame - it only needs a prompt
     setIsGenerating(true);
     
     // Start timer
@@ -393,22 +456,16 @@ const VideoGenerator = () => {
       formData.append('audioEnabled', String(audioEnabled));
       formData.append('feature', mode.type);
       formData.append('generationType', generationType);
-      
-      // Log form data for debugging
-      console.log('📤 Sending generation request:', {
-        modelName: selectedModel.name,
-        duration: durationValue,
-        aspectRatio: aspectRatio || '16:9',
-        resolution: resolution || '720p',
-        generationType,
-        feature: mode.type
-      });
 
       if (uploadedVideoFile) formData.append('video', uploadedVideoFile);
       if (uploadedImageFile) formData.append('image', uploadedImageFile);
       if (uploadedCharacterFile) formData.append('characterImage', uploadedCharacterFile);
       if (startFrameFile) formData.append('startFrame', startFrameFile);
-      if (endFrameFile) formData.append('endFrame', endFrameFile);
+      // End frame is only for Video Generation (text-to-video, image-to-video, video-to-video)
+      // Not for Image Generation (text-to-image, image-to-image)
+      if (endFrameFile && generationType !== 'text-to-image' && generationType !== 'image-to-image') {
+        formData.append('endFrame', endFrameFile);
+      }
 
       const response = await fetch(`${API_BASE_URL}/generations`, {
         method: 'POST',
@@ -472,36 +529,188 @@ const VideoGenerator = () => {
     }
   };
 
+  const handleGenerateConstructionStages = async () => {
+    // Validate inputs
+    if (!selectedModel) {
+      alert('⚠️ No model selected. Please select a model first.');
+      return;
+    }
+
+    // Check if model supports image-to-image
+    if (selectedModel.capabilities?.supportedFeatures && 
+        !selectedModel.capabilities.supportedFeatures.includes('image-to-image')) {
+      alert(`⚠️ Model "${selectedModel.name}" does not support image-to-image generation.\n\nPlease select Kling O1 or another model that supports image-to-image.`);
+      return;
+    }
+
+    // Check if image is uploaded (either uploadedImageFile or startFrameFile)
+    const imageFile = uploadedImageFile || startFrameFile;
+    if (!imageFile) {
+      alert('⚠️ Please upload a reference house image first.');
+      return;
+    }
+
+    setIsGeneratingStages(true);
+    setConstructionStages(null);
+    setStagesProgress({});
+
+    // Store imageFile reference for use in the callback
+    const imageFileRef = imageFile;
+
+    try {
+      // Call the construction stages endpoint with file upload
+      const formData = new FormData();
+      formData.append('image', imageFileRef);
+      formData.append('modelName', selectedModel.name);
+      formData.append('aspectRatio', aspectRatio || '16:9');
+
+      const response = await fetch(`${API_BASE_URL}/generations/construction-stages`, {
+        method: 'POST',
+        body: formData
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || data.message || `Failed to generate construction stages (${response.status})`);
+      }
+
+      // Update progress for each stage
+      const progress = {};
+      data.stages.forEach((stage, index) => {
+        if (stage.success) {
+          progress[stage.stageKey] = 'completed';
+        } else {
+          progress[stage.stageKey] = 'failed';
+        }
+      });
+      setStagesProgress(progress);
+
+      setConstructionStages(data);
+      
+      // Add all successful stages to generations list
+      data.stages.forEach(stage => {
+        if (stage.success && stage.imageUrl) {
+          const mappedStage = {
+            id: stage.generationId,
+            prompt: stage.prompt,
+            model: selectedModel.name,
+            duration: '0s',
+            aspectRatio: aspectRatio || '16:9',
+            resolution: resolution || '720p',
+            status: 'completed',
+            feature: 'image-to-image',
+            createdAt: new Date(),
+            thumbnail: stage.imageUrl,
+            imageUrl: stage.imageUrl,
+            inputImageUrl: imageFileRef ? URL.createObjectURL(imageFileRef) : null
+          };
+          setGenerations(prev => [mappedStage, ...prev]);
+        }
+      });
+
+    } catch (error) {
+      console.error('Error generating construction stages:', error);
+      alert(`Failed to generate construction stages: ${error.message}`);
+      setConstructionStages({
+        success: false,
+        error: error.message,
+        stages: []
+      });
+    } finally {
+      setIsGeneratingStages(false);
+    }
+  };
+
   const handleDeleteVideo = async (videoId, event) => {
     if (event) {
       event.stopPropagation();
     }
 
-    setDeleteConfirmation({ show: true, videoId });
+    setDeleteConfirmation({ show: true, videoId, videoIds: null });
+  };
+
+  const handleBulkDelete = (event) => {
+    if (event) {
+      event.stopPropagation();
+    }
+
+    if (selectedVideoIds.length === 0) {
+      alert('Vui lòng chọn ít nhất một video để xóa');
+      return;
+    }
+
+    setDeleteConfirmation({ show: true, videoId: null, videoIds: selectedVideoIds });
   };
 
   const confirmDelete = async () => {
     const videoId = deleteConfirmation.videoId;
-    setDeleteConfirmation({ show: false, videoId: null });
+    const videoIds = deleteConfirmation.videoIds;
+    setDeleteConfirmation({ show: false, videoId: null, videoIds: null });
 
     try {
-      const response = await fetch(`${API_BASE_URL}/generations/${videoId}`, {
-        method: 'DELETE'
-      });
+      if (videoIds && videoIds.length > 0) {
+        // Bulk delete
+        const response = await fetch(`${API_BASE_URL}/generations/bulk-delete`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ ids: videoIds })
+        });
 
-      if (!response.ok) {
-        throw new Error(`Failed to delete video (${response.status})`);
+        if (!response.ok) {
+          throw new Error(`Failed to delete videos (${response.status})`);
+        }
+
+        // Remove from local state
+        setGenerations(prev => prev.filter(gen => !videoIds.includes(gen.id)));
+        setSelectedVideoIds([]);
+        setSelectionMode(false);
+      } else if (videoId) {
+        // Single delete
+        const response = await fetch(`${API_BASE_URL}/generations/${videoId}`, {
+          method: 'DELETE'
+        });
+
+        if (!response.ok) {
+          throw new Error(`Failed to delete video (${response.status})`);
+        }
+
+        // Remove from local state
+        setGenerations(prev => prev.filter(gen => gen.id !== videoId));
       }
-
-      // Remove from local state
-      setGenerations(prev => prev.filter(gen => gen.id !== videoId));
     } catch (error) {
-      alert('Failed to delete video. Please try again.');
+      alert('Xóa video thất bại. Vui lòng thử lại.');
     }
   };
 
   const cancelDelete = () => {
-    setDeleteConfirmation({ show: false, videoId: null });
+    setDeleteConfirmation({ show: false, videoId: null, videoIds: null });
+  };
+
+  const toggleSelectionMode = () => {
+    setSelectionMode(!selectionMode);
+    setSelectedVideoIds([]);
+  };
+
+  const toggleVideoSelection = (videoId) => {
+    setSelectedVideoIds(prev => {
+      if (prev.includes(videoId)) {
+        return prev.filter(id => id !== videoId);
+      } else {
+        return [...prev, videoId];
+      }
+    });
+  };
+
+  const selectAllVideos = () => {
+    const allVideoIds = generations.map(gen => gen.id);
+    setSelectedVideoIds(allVideoIds);
+  };
+
+  const deselectAllVideos = () => {
+    setSelectedVideoIds([]);
   };
 
   const handleUploadToTikTok = async (video) => {
@@ -580,7 +789,8 @@ const VideoGenerator = () => {
                       <button
                         onClick={() => {
                           setTextMode('text-to-image');
-                          // Clear start/end frames when switching modes
+                          // Clear files when switching to Image Generation mode
+                          // Note: endFrameFile is only for Video Generation, so clear it here
                           setStartFrameFile(null);
                           setEndFrameFile(null);
                         }}
@@ -595,9 +805,9 @@ const VideoGenerator = () => {
                       <button
                         onClick={() => {
                           setTextMode('text-to-video');
-                          // Clear start/end frames when switching modes
+                          // Clear start frame when switching to Video Generation mode
+                          // Note: endFrameFile is valid in Video Generation, so we can keep it
                           setStartFrameFile(null);
-                          setEndFrameFile(null);
                         }}
                         className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
                           textMode === 'text-to-video'
@@ -686,7 +896,8 @@ const VideoGenerator = () => {
                 </div>
               )}
 
-              {/* Start Frame and End Frame Inputs - Show when Text to Image mode is selected */}
+              {/* Start Frame Input - Show when Text to Image mode is selected */}
+              {/* Note: End frame is only available in Video Generation modes, not Image Generation */}
               {!motionControlEnabled && textMode === 'text-to-image' && (
                 <>
                   {/* Start Frame Input */}
@@ -695,7 +906,7 @@ const VideoGenerator = () => {
                       <div className="flex items-center gap-2">
                         <Image size={16} className="text-neutral-400" />
                         <span className="text-sm text-white">Start frame</span>
-                        <span className="text-xs text-neutral-500">(Required)</span>
+                        <span className="text-xs text-neutral-500">(Optional)</span>
                       </div>
                       {startFrameFile && (
                         <button 
@@ -727,66 +938,51 @@ const VideoGenerator = () => {
                           accept="image/*" 
                           className="hidden"
                           onChange={(e) => {
-                            if (e.target.files?.[0]) {
-                              setStartFrameFile(e.target.files[0]);
+                            const file = e.target.files?.[0];
+                            if (file) {
+                              // Validate file size (max 10MB)
+                              const maxSize = 10 * 1024 * 1024; // 10MB in bytes
+                              if (file.size > maxSize) {
+                                console.error('❌ Start frame upload failed: File size exceeds 10MB limit', {
+                                  fileName: file.name,
+                                  fileSize: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
+                                  maxSize: '10 MB'
+                                });
+                                alert('⚠️ File size exceeds 10MB limit. Please upload a smaller image.');
+                                e.target.value = ''; // Reset input
+                                return;
+                              }
+                              
+                              // Validate file type
+                              const validTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+                              if (!validTypes.includes(file.type)) {
+                                console.error('❌ Start frame upload failed: Invalid file type', {
+                                  fileName: file.name,
+                                  fileType: file.type,
+                                  validTypes: validTypes
+                                });
+                                alert('⚠️ Invalid file type. Please upload JPG, PNG, or WEBP image.');
+                                e.target.value = ''; // Reset input
+                                return;
+                              }
+                              
+                              // Log upload success
+                              const uploadInfo = {
+                                fileName: file.name,
+                                fileSize: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
+                                fileType: file.type,
+                                type: 'start-frame',
+                                mode: currentMode.type,
+                                timestamp: new Date().toISOString()
+                              };
+                              
+                              setStartFrameFile(file);
                             }
                           }}
                         />
                         <div className="border-2 border-dashed border-neutral-700 rounded-lg p-6 hover:border-neutral-600 transition-colors text-center">
                           <Upload size={24} className="text-neutral-500 mx-auto mb-2" />
                           <p className="text-sm text-neutral-400">Click to upload start frame</p>
-                          <p className="text-xs text-neutral-600 mt-1">JPG, PNG, WEBP (max 10MB)</p>
-                        </div>
-                      </label>
-                    )}
-                  </div>
-
-                  {/* End Frame Input */}
-                  <div className="bg-neutral-900/50 border border-neutral-800 rounded-xl p-4 mb-4">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <Image size={16} className="text-neutral-400" />
-                        <span className="text-sm text-white">End frame</span>
-                        <span className="text-xs text-neutral-500">(Optional)</span>
-                      </div>
-                      {endFrameFile && (
-                        <button 
-                          onClick={() => setEndFrameFile(null)}
-                          className="text-xs text-red-400 hover:text-red-300"
-                        >
-                          Remove
-                        </button>
-                      )}
-                    </div>
-                    {endFrameFile ? (
-                      <div className="flex items-center gap-3 p-3 bg-neutral-800/50 rounded-lg">
-                        <div className="w-16 h-16 bg-neutral-700 rounded overflow-hidden">
-                          <img 
-                            src={URL.createObjectURL(endFrameFile)} 
-                            alt="End frame" 
-                            className="w-full h-full object-cover"
-                          />
-                        </div>
-                        <div className="flex-1">
-                          <p className="text-sm text-white">{endFrameFile.name}</p>
-                          <p className="text-xs text-neutral-500">End frame uploaded</p>
-                        </div>
-                      </div>
-                    ) : (
-                      <label className="block cursor-pointer">
-                        <input 
-                          type="file" 
-                          accept="image/*" 
-                          className="hidden"
-                          onChange={(e) => {
-                            if (e.target.files?.[0]) {
-                              setEndFrameFile(e.target.files[0]);
-                            }
-                          }}
-                        />
-                        <div className="border-2 border-dashed border-neutral-700 rounded-lg p-6 hover:border-neutral-600 transition-colors text-center">
-                          <Upload size={24} className="text-neutral-500 mx-auto mb-2" />
-                          <p className="text-sm text-neutral-400">Click to upload end frame</p>
                           <p className="text-xs text-neutral-600 mt-1">JPG, PNG, WEBP (max 10MB)</p>
                         </div>
                       </label>
@@ -840,8 +1036,50 @@ const VideoGenerator = () => {
                         accept="image/*" 
                         className="hidden"
                         onChange={(e) => {
-                          if (e.target.files?.[0]) {
-                            setUploadedImageFile(e.target.files[0]);
+                          const file = e.target.files?.[0];
+                          if (file) {
+                            // Validate file size (max 10MB)
+                            const maxSize = 10 * 1024 * 1024; // 10MB in bytes
+                            if (file.size > maxSize) {
+                              console.error('❌ Upload failed: File size exceeds 10MB limit', {
+                                fileName: file.name,
+                                fileSize: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
+                                maxSize: '10 MB'
+                              });
+                              alert('⚠️ File size exceeds 10MB limit. Please upload a smaller image.');
+                              e.target.value = ''; // Reset input
+                              return;
+                            }
+                            
+                            // Validate file type
+                            const validTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+                            if (!validTypes.includes(file.type)) {
+                              console.error('❌ Upload failed: Invalid file type', {
+                                fileName: file.name,
+                                fileType: file.type,
+                                validTypes: validTypes
+                              });
+                              alert('⚠️ Invalid file type. Please upload JPG, PNG, or WEBP image.');
+                              e.target.value = ''; // Reset input
+                              return;
+                            }
+                            
+                            // Log upload success
+                            const uploadInfo = {
+                              fileName: file.name,
+                              fileSize: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
+                              fileType: file.type,
+                              mode: currentMode.type,
+                              timestamp: new Date().toISOString()
+                            };
+                            
+                            setUploadedImageFile(file);
+                            
+                            if (currentMode.type === 'image-to-image') {
+                              alert(`✅ Image uploaded successfully!\n\nFile: ${file.name}\nSize: ${(file.size / 1024 / 1024).toFixed(2)} MB\n\nYou can now generate your image-to-image transformation.`);
+                            } else {
+                              alert(`✅ Image uploaded successfully!\n\nFile: ${file.name}\nSize: ${(file.size / 1024 / 1024).toFixed(2)} MB`);
+                            }
                           }
                         }}
                       />
@@ -894,8 +1132,44 @@ const VideoGenerator = () => {
                         accept="image/*" 
                         className="hidden"
                         onChange={(e) => {
-                          if (e.target.files?.[0]) {
-                            setUploadedCharacterFile(e.target.files[0]);
+                          const file = e.target.files?.[0];
+                          if (file) {
+                            // Validate file size (max 10MB)
+                            const maxSize = 10 * 1024 * 1024; // 10MB in bytes
+                            if (file.size > maxSize) {
+                              console.error('❌ Character image upload failed: File size exceeds 10MB limit', {
+                                fileName: file.name,
+                                fileSize: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
+                                maxSize: '10 MB'
+                              });
+                              alert('⚠️ File size exceeds 10MB limit. Please upload a smaller image.');
+                              e.target.value = ''; // Reset input
+                              return;
+                            }
+                            
+                            // Validate file type
+                            const validTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+                            if (!validTypes.includes(file.type)) {
+                              console.error('❌ Character image upload failed: Invalid file type', {
+                                fileName: file.name,
+                                fileType: file.type,
+                                validTypes: validTypes
+                              });
+                              alert('⚠️ Invalid file type. Please upload JPG, PNG, or WEBP image.');
+                              e.target.value = ''; // Reset input
+                              return;
+                            }
+                            
+                            // Log upload success
+                            const uploadInfo = {
+                              fileName: file.name,
+                              fileSize: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
+                              fileType: file.type,
+                              type: 'character-image',
+                              timestamp: new Date().toISOString()
+                            };
+                            
+                            setUploadedCharacterFile(file);
                           }
                         }}
                       />
@@ -1052,7 +1326,7 @@ const VideoGenerator = () => {
 
               {/* Model Selector at the bottom */}
               <VideoModelSelector 
-                models={models}
+                models={filteredModels}
                 selectedModel={selectedModel}
                 onModelChange={setSelectedModel}
               />
@@ -1187,7 +1461,7 @@ const VideoGenerator = () => {
 
               {/* Model Selector at the bottom */}
               <VideoModelSelector 
-                models={models}
+                models={filteredModels}
                 selectedModel={selectedModel}
                 onModelChange={setSelectedModel}
               />
@@ -1281,7 +1555,7 @@ const VideoGenerator = () => {
 
               {/* Model Selector at the bottom */}
               <VideoModelSelector 
-                models={models}
+                models={filteredModels}
                 selectedModel={selectedModel}
                 onModelChange={setSelectedModel}
               />
@@ -1349,7 +1623,7 @@ const VideoGenerator = () => {
 
               {/* Model Selector at the bottom */}
               <VideoModelSelector 
-                models={models}
+                models={filteredModels}
                 selectedModel={selectedModel}
                 onModelChange={setSelectedModel}
               />
@@ -1357,11 +1631,42 @@ const VideoGenerator = () => {
           )}
         </div>
 
+        {/* Construction Stages Button - Show when image is uploaded in Image generation modes */}
+        {((uploadedImageFile || startFrameFile) && (
+          activeTab === 'image-to-image' || 
+          activeTab === 'text-to-image' || 
+          (activeTab === 'text-to-video' && textMode === 'text-to-image')
+        )) && (
+          <div className="mt-6">
+            <div className="bg-teal-900/20 border border-teal-500/30 rounded-xl p-4 mb-3">
+              <div className="flex items-start gap-2">
+                <Info size={16} className="text-teal-400 flex-shrink-0 mt-0.5" />
+                <div className="text-xs text-teal-300">
+                  <strong>Construction Stages Feature:</strong> Automatically generate 6 construction stage images from your uploaded house image, maintaining the same camera angle and composition.
+                </div>
+              </div>
+            </div>
+            <button 
+              onClick={handleGenerateConstructionStages}
+              disabled={isGeneratingStages || isGenerating}
+              className="w-full bg-teal-500 hover:bg-teal-600 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2 transition-colors"
+            >
+              <Zap size={18} />
+              <span>{isGeneratingStages ? 'Generating Construction Stages...' : 'Generate Construction Stages (6 Images)'}</span>
+            </button>
+            {isGeneratingStages && (
+              <div className="mt-3 text-sm text-neutral-400 text-center">
+                This will generate 6 construction stage images sequentially. Please wait...
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Generate Button */}
         <div className="mt-6">
           <button 
             onClick={handleGenerate}
-            disabled={isGenerating}
+            disabled={isGenerating || isGeneratingStages}
             className="w-full bg-lime-400 hover:bg-lime-500 disabled:opacity-60 disabled:cursor-not-allowed text-black font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-colors text-lg"
           >
             <span>{isGenerating ? 'Generating...' : 'Generate'}</span>
@@ -1487,6 +1792,85 @@ const VideoGenerator = () => {
           </div>
         )}
 
+        {/* Construction Stages Results Display */}
+        {constructionStages && (
+          <div className="mt-6 bg-gradient-to-r from-teal-900/30 to-teal-800/30 border-2 border-teal-400/50 rounded-2xl p-6 shadow-lg">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-white font-bold text-lg">Construction Stages Results</h3>
+              <button
+                onClick={() => setConstructionStages(null)}
+                className="text-neutral-400 hover:text-white"
+              >
+                <X size={20} />
+              </button>
+            </div>
+            
+            {constructionStages.success ? (
+              <div className="space-y-4">
+                <div className="text-sm text-teal-400 mb-4">
+                  ✅ All {constructionStages.stages.length} stages generated successfully!
+                </div>
+                <div className="grid grid-cols-3 gap-3">
+                  {constructionStages.stages
+                    .sort((a, b) => a.stageOrder - b.stageOrder)
+                    .map((stage) => (
+                      <div
+                        key={stage.stageKey}
+                        className={`bg-neutral-800/50 rounded-lg p-3 border ${
+                          stage.success
+                            ? 'border-teal-500/50'
+                            : 'border-red-500/50'
+                        }`}
+                      >
+                        <div className="text-xs text-neutral-400 mb-2">
+                          Stage {stage.stageOrder}
+                        </div>
+                        <div className="text-sm font-medium text-white mb-2">
+                          {stage.stageKey
+                            .split('-')
+                            .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+                            .join(' ')}
+                        </div>
+                        {stage.success && stage.imageUrl ? (
+                          <div className="relative w-full aspect-square rounded overflow-hidden bg-neutral-700 cursor-zoom-in"
+                            onClick={() => setImageZoomModal({ show: true, imageUrl: stage.imageUrl })}
+                          >
+                            <img
+                              src={stage.imageUrl}
+                              alt={`Stage ${stage.stageOrder}`}
+                              className="w-full h-full object-cover"
+                            />
+                            <div className="absolute inset-0 bg-black/0 hover:bg-black/20 transition-colors flex items-center justify-center">
+                              <Image size={24} className="text-white opacity-0 hover:opacity-100 transition-opacity" />
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="w-full aspect-square rounded bg-red-900/20 flex items-center justify-center">
+                            <div className="text-xs text-red-400 text-center">
+                              ❌ Failed
+                              {stage.error && (
+                                <div className="mt-1 text-[10px]">{stage.error}</div>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                </div>
+              </div>
+            ) : (
+              <div className="text-sm text-red-400">
+                ❌ Generation failed: {constructionStages.error || 'Unknown error'}
+                {constructionStages.stages && constructionStages.stages.length > 0 && (
+                  <div className="mt-3 text-xs text-neutral-400">
+                    Partial results: {constructionStages.stages.filter(s => s.success).length} of {constructionStages.stages.length} stages completed
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Latest Creation Section */}
         {generations.length > 0 && generations[0] && (
           <div className="mt-12">
@@ -1579,7 +1963,8 @@ const VideoGenerator = () => {
                               <img 
                                 src={latestVideo.imageUrl || latestVideo.thumbnail} 
                                 alt="Generated image"
-                                className="w-full h-full object-contain"
+                                className="w-full h-full object-contain cursor-zoom-in"
+                                onClick={() => setImageZoomModal({ show: true, imageUrl: latestVideo.imageUrl || latestVideo.thumbnail })}
                               />
                             ) : (
                               <video 
@@ -1757,28 +2142,70 @@ const VideoGenerator = () => {
         {/* History Section */}
         <div className="mt-20 pt-8 border-t border-neutral-800">
           <div className="flex items-center justify-between mb-6">
-            <h2 className="text-2xl font-bold">History</h2>
-            <div className="flex items-center gap-2 bg-neutral-900 rounded-lg p-1">
-              <button 
-                onClick={() => setViewMode('grid')}
-                className={`px-4 py-2 rounded-md font-medium text-sm transition-colors ${
-                  viewMode === 'grid' 
-                    ? 'bg-lime-400 text-black' 
-                    : 'text-neutral-400 hover:text-white'
-                }`}
-              >
-                Grid
-              </button>
-              <button 
-                onClick={() => setViewMode('list')}
-                className={`px-4 py-2 rounded-md font-medium text-sm transition-colors ${
-                  viewMode === 'list' 
-                    ? 'bg-lime-400 text-black' 
-                    : 'text-neutral-400 hover:text-white'
-                }`}
-              >
-                List
-              </button>
+            <div className="flex items-center gap-4">
+              <h2 className="text-2xl font-bold">History</h2>
+              {selectionMode && (
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-neutral-400">
+                    {selectedVideoIds.length} đã chọn
+                  </span>
+                  {selectedVideoIds.length > 0 && (
+                    <button
+                      onClick={handleBulkDelete}
+                      className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
+                    >
+                      <Trash2 size={16} />
+                      Xóa đã chọn
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-3">
+              {selectionMode && generations.length > 1 && (
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={selectedVideoIds.length === generations.length - 1 ? deselectAllVideos : selectAllVideos}
+                    className="px-4 py-2 rounded-lg text-sm font-medium bg-neutral-800 hover:bg-neutral-700 text-white transition-colors"
+                  >
+                    {selectedVideoIds.length === generations.length - 1 ? 'Bỏ chọn tất cả' : 'Chọn tất cả'}
+                  </button>
+                </div>
+              )}
+              {generations.length > 1 && (
+                <button
+                  onClick={toggleSelectionMode}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                    selectionMode
+                      ? 'bg-lime-400 text-black hover:bg-lime-500'
+                      : 'bg-neutral-800 hover:bg-neutral-700 text-white'
+                  }`}
+                >
+                  {selectionMode ? 'Hủy' : 'Chọn'}
+                </button>
+              )}
+              <div className="flex items-center gap-2 bg-neutral-900 rounded-lg p-1">
+                <button 
+                  onClick={() => setViewMode('grid')}
+                  className={`px-4 py-2 rounded-md font-medium text-sm transition-colors ${
+                    viewMode === 'grid' 
+                      ? 'bg-lime-400 text-black' 
+                      : 'text-neutral-400 hover:text-white'
+                  }`}
+                >
+                  Grid
+                </button>
+                <button 
+                  onClick={() => setViewMode('list')}
+                  className={`px-4 py-2 rounded-md font-medium text-sm transition-colors ${
+                    viewMode === 'list' 
+                      ? 'bg-lime-400 text-black' 
+                      : 'text-neutral-400 hover:text-white'
+                  }`}
+                >
+                  List
+                </button>
+              </div>
             </div>
           </div>
 
@@ -1839,7 +2266,11 @@ const VideoGenerator = () => {
                                   <img 
                                     src={gen.imageUrl || gen.thumbnail || FALLBACK_THUMBNAIL} 
                                     alt="Generated image"
-                                    className="w-full h-full object-contain"
+                                    className="w-full h-full object-contain cursor-zoom-in"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setImageZoomModal({ show: true, imageUrl: gen.imageUrl || gen.thumbnail || FALLBACK_THUMBNAIL });
+                                    }}
                                   />
                                 ) : (
                                   <>
@@ -1861,8 +2292,23 @@ const VideoGenerator = () => {
                                 )}
                               </>
                             )}
+                            {/* Checkbox for Selection Mode */}
+                            {selectionMode && (
+                              <div className="absolute top-2 left-2 z-20">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedVideoIds.includes(gen.id)}
+                                  onChange={(e) => {
+                                    e.stopPropagation();
+                                    toggleVideoSelection(gen.id);
+                                  }}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="w-5 h-5 rounded border-2 border-white bg-neutral-900 checked:bg-lime-400 checked:border-lime-400 cursor-pointer"
+                                />
+                              </div>
+                            )}
                             {/* Feature Badge */}
-                            <div className="absolute top-2 left-2">
+                            <div className={`absolute top-2 ${selectionMode ? 'left-9' : 'left-2'}`}>
                               <span className={`${FEATURE_LABELS[gen.feature]?.color || 'bg-neutral-600'} text-white px-2 py-0.5 rounded text-xs font-medium`}>
                                 {FEATURE_LABELS[gen.feature]?.name || 'Video'}
                               </span>
@@ -1883,13 +2329,15 @@ const VideoGenerator = () => {
                               </div>
                             )}
                             {/* Delete Button */}
-                            <button
-                              onClick={(e) => handleDeleteVideo(gen.id, e)}
-                              className="absolute bottom-2 right-2 bg-red-500/90 hover:bg-red-600 text-white p-2 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                              title="Delete video"
-                            >
-                              <Trash2 size={16} />
-                            </button>
+                            {!selectionMode && (
+                              <button
+                                onClick={(e) => handleDeleteVideo(gen.id, e)}
+                                className="absolute bottom-2 right-2 bg-red-500/90 hover:bg-red-600 text-white p-2 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                                title="Delete video"
+                              >
+                                <Trash2 size={16} />
+                              </button>
+                            )}
                           </div>
                           <div className="bg-neutral-900 p-3">
                             <p className="text-xs text-neutral-400 line-clamp-2 mb-2">{gen.prompt}</p>
@@ -1919,8 +2367,29 @@ const VideoGenerator = () => {
                         >
                           <div 
                             className="flex gap-4 p-4 cursor-pointer"
-                            onClick={() => setHistoryVideoModal({ show: true, video: gen })}
+                            onClick={() => {
+                              if (selectionMode) {
+                                toggleVideoSelection(gen.id);
+                              } else {
+                                setHistoryVideoModal({ show: true, video: gen });
+                              }
+                            }}
                           >
+                            {/* Checkbox for Selection Mode */}
+                            {selectionMode && (
+                              <div className="flex items-center">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedVideoIds.includes(gen.id)}
+                                  onChange={(e) => {
+                                    e.stopPropagation();
+                                    toggleVideoSelection(gen.id);
+                                  }}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="w-5 h-5 rounded border-2 border-white bg-neutral-900 checked:bg-lime-400 checked:border-lime-400 cursor-pointer"
+                                />
+                              </div>
+                            )}
                             {/* Thumbnail */}
                             <div className="relative w-48 h-27 flex-shrink-0 bg-neutral-800 rounded-lg overflow-hidden">
                               {gen.status === 'in_progress' ? (
@@ -1947,7 +2416,11 @@ const VideoGenerator = () => {
                                     <img 
                                       src={gen.imageUrl || gen.thumbnail || FALLBACK_THUMBNAIL} 
                                       alt="Generated image"
-                                      className="w-full h-full object-contain"
+                                      className="w-full h-full object-contain cursor-zoom-in"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setImageZoomModal({ show: true, imageUrl: gen.imageUrl || gen.thumbnail || FALLBACK_THUMBNAIL });
+                                      }}
                                     />
                                   ) : (
                                     <>
@@ -2014,15 +2487,17 @@ const VideoGenerator = () => {
                             </div>
 
                             {/* Delete Button */}
-                            <div className="flex items-center">
-                              <button
-                                onClick={(e) => handleDeleteVideo(gen.id, e)}
-                                className="bg-red-500/90 hover:bg-red-600 text-white p-2 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
-                                title="Delete video"
-                              >
-                                <Trash2 size={16} />
-                              </button>
-                            </div>
+                            {!selectionMode && (
+                              <div className="flex items-center">
+                                <button
+                                  onClick={(e) => handleDeleteVideo(gen.id, e)}
+                                  className="bg-red-500/90 hover:bg-red-600 text-white p-2 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
+                                  title="Delete video"
+                                >
+                                  <Trash2 size={16} />
+                                </button>
+                              </div>
+                            )}
                           </div>
                         </div>
                       ))}
@@ -2051,11 +2526,14 @@ const VideoGenerator = () => {
               <div className="w-10 h-10 bg-red-500/20 rounded-full flex items-center justify-center flex-shrink-0">
                 <Trash2 size={20} className="text-red-400" />
               </div>
-              <h3 className="text-white font-semibold text-lg">Confirm Delete</h3>
+              <h3 className="text-white font-semibold text-lg">Xác nhận xóa</h3>
             </div>
             
             <p className="text-neutral-300 text-sm mb-6">
-              Are you sure you want to delete this video?
+              {deleteConfirmation.videoIds 
+                ? `Bạn có chắc chắn muốn xóa ${deleteConfirmation.videoIds.length} video đã chọn?`
+                : 'Bạn có chắc chắn muốn xóa video này?'
+              }
             </p>
             
             <div className="flex gap-3">
@@ -2063,13 +2541,13 @@ const VideoGenerator = () => {
                 onClick={cancelDelete}
                 className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-white font-medium py-2.5 px-4 rounded-lg transition-colors text-sm"
               >
-                Cancel
+                Hủy
               </button>
               <button
                 onClick={confirmDelete}
                 className="flex-1 bg-red-500 hover:bg-red-600 text-white font-medium py-2.5 px-4 rounded-lg transition-colors text-sm"
               >
-                Delete
+                Xóa
               </button>
             </div>
           </div>
@@ -2455,6 +2933,32 @@ const VideoGenerator = () => {
                 </button>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Image Zoom Modal */}
+      {imageZoomModal.show && (
+        <div 
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4"
+          onClick={() => setImageZoomModal({ show: false, imageUrl: null })}
+        >
+          <button
+            onClick={() => setImageZoomModal({ show: false, imageUrl: null })}
+            className="absolute top-4 right-4 text-white hover:text-neutral-300 transition-colors z-10"
+            aria-label="Close"
+          >
+            <X size={32} />
+          </button>
+          <div 
+            className="max-w-[90vw] max-h-[90vh] flex items-center justify-center"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <img 
+              src={imageZoomModal.imageUrl} 
+              alt="Zoomed image"
+              className="max-w-full max-h-[90vh] object-contain rounded-lg"
+            />
           </div>
         </div>
       )}
