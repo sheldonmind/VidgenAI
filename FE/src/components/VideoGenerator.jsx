@@ -6,6 +6,93 @@ import TikTokSettings from './TikTokSettings';
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000/api/v1';
 const FALLBACK_THUMBNAIL = 'https://placehold.co/600x400?text=Generating';
 
+// Helper function to format date and time
+const formatDateTime = (date) => {
+  if (!date) return '';
+  const d = new Date(date);
+  const now = new Date();
+  const diffMs = now - d;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+
+  // Show relative time if less than 24 hours
+  if (diffMins < 1) {
+    return 'Vừa xong';
+  } else if (diffMins < 60) {
+    return `${diffMins} phút trước`;
+  } else if (diffHours < 24) {
+    return `${diffHours} giờ trước`;
+  } else if (diffDays === 1) {
+    return 'Hôm qua';
+  } else if (diffDays < 7) {
+    return `${diffDays} ngày trước`;
+  } else {
+    // Show full date and time for older items
+    return d.toLocaleString('vi-VN', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  }
+};
+
+// Helper function to format full date and time
+const formatFullDateTime = (date) => {
+  if (!date) return '';
+  const d = new Date(date);
+  return d.toLocaleString('vi-VN', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+};
+
+// Helper function to format time duration (seconds to readable format)
+const formatTime = (seconds) => {
+  if (seconds < 60) {
+    return `${seconds}s`;
+  } else if (seconds < 3600) {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
+  } else {
+    const hours = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    if (mins === 0 && secs === 0) {
+      return `${hours}h`;
+    } else if (secs === 0) {
+      return `${hours}h ${mins}m`;
+    } else {
+      return `${hours}h ${mins}m ${secs}s`;
+    }
+  }
+};
+
+// Helper function to calculate total waiting time
+// Accepts optional currentTime parameter for real-time updates
+const calculateWaitingTime = (generation, currentTimeOverride = null) => {
+  if (!generation || !generation.createdAt) return null;
+  
+  const startTime = new Date(generation.createdAt).getTime();
+  const endTime = generation.status === 'completed' && generation.updatedAt
+    ? new Date(generation.updatedAt).getTime()
+    : (currentTimeOverride || Date.now());
+  
+  const totalSeconds = Math.floor((endTime - startTime) / 1000);
+  return totalSeconds;
+};
+
+// Helper function to format waiting time for display
+// This needs to be inside the component to access currentTime state
+// We'll create it as a component-level function
+
 const mapGeneration = (generation) => {
   // Use proxy endpoints for Google API URLs, or original URLs for local files
   const needsProxy = generation.videoUrl?.includes('generativelanguage.googleapis.com');
@@ -23,6 +110,7 @@ const mapGeneration = (generation) => {
     errorCode: generation.errorCode,
     errorMessage: generation.errorMessage,
     createdAt: new Date(generation.createdAt),
+    updatedAt: generation.updatedAt ? new Date(generation.updatedAt) : null,
     thumbnail: needsThumbnailProxy 
       ? `${API_BASE_URL}/generations/${generation.id}/thumbnail`
       : (generation.thumbnailUrl || generation.imageUrl || generation.inputImageUrl || FALLBACK_THUMBNAIL),
@@ -54,6 +142,7 @@ const VideoGenerator = () => {
   const [activeTab, setActiveTab] = useState('text-to-video');
   const [models, setModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState(null);
+  const [selectedVideoModel, setSelectedVideoModel] = useState(null);
   const [selectedPreset, setSelectedPreset] = useState(null);
   const [uploadedVideo, setUploadedVideo] = useState(null);
   const [prompt, setPrompt] = useState('');
@@ -90,13 +179,23 @@ const VideoGenerator = () => {
   
   // Construction stages states
   const [isGeneratingStages, setIsGeneratingStages] = useState(false);
-  const [constructionStages, setConstructionStages] = useState(null); // { stages: [...], success: boolean }
+  const [constructionStages, setConstructionStages] = useState(null); // { stages: [...], videos: [...], success: boolean }
   const [stagesProgress, setStagesProgress] = useState({}); // { stageKey: 'in_progress' | 'completed' | 'failed' }
+  const [videosProgress, setVideosProgress] = useState({}); // { generationId: 'in_progress' | 'completed' | 'failed' }
+  const [isMergingVideos, setIsMergingVideos] = useState(false);
+  const [mergedVideo, setMergedVideo] = useState(null); // { generationId, videoUrl, thumbnailUrl, duration }
+  const [hasAutoMerged, setHasAutoMerged] = useState(false); // Track if auto-merge has been triggered
   
   // Timer states
   const [generationTimer, setGenerationTimer] = useState(null);
   const [elapsedTime, setElapsedTime] = useState(0);
   const timerIntervalRef = useRef(null);
+  const [currentTime, setCurrentTime] = useState(Date.now());
+  
+  // Construction Stages timer states
+  const [constructionStagesStartTime, setConstructionStagesStartTime] = useState(null);
+  const [constructionStagesElapsedTime, setConstructionStagesElapsedTime] = useState(0);
+  const constructionStagesTimerRef = useRef(null);
 
   // Detect generation type based on prompt and uploads
   const detectGenerationType = () => {
@@ -169,6 +268,16 @@ const VideoGenerator = () => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // Helper function to format waiting time for display
+  // Uses currentTime state for real-time updates of in_progress videos
+  const formatWaitingTime = (generation) => {
+    const waitingSeconds = calculateWaitingTime(generation, currentTime);
+    if (waitingSeconds === null) return null;
+    
+    // Use the global formatTime function (defined outside component)
+    return formatTime(waitingSeconds);
   };
 
   // Determine current mode for badge display
@@ -248,6 +357,20 @@ const VideoGenerator = () => {
         setModels(loadedModels);
         if (loadedModels.length > 0 && !selectedModel) {
           setSelectedModel(loadedModels[0]);
+        }
+        // Auto-select first video-capable model for video generation
+        if (loadedModels.length > 0 && !selectedVideoModel) {
+          const videoModels = loadedModels.filter(model => 
+            model.capabilities?.supportedFeatures?.includes('image-to-video') || 
+            model.capabilities?.supportedFeatures?.includes('text-to-video')
+          );
+          if (videoModels.length > 0) {
+            // Prefer Kling O1 if available, otherwise use first video model
+            const klingO1 = videoModels.find(m => m.name === 'Kling O1');
+            setSelectedVideoModel(klingO1 || videoModels[0]);
+          } else {
+            setSelectedVideoModel(loadedModels[0]);
+          }
         }
       } catch (error) {
         console.error('❌ Failed to load models:', error);
@@ -400,6 +523,18 @@ const VideoGenerator = () => {
     };
   }, [generationTimer]);
 
+  // Update waiting time display for in_progress videos every second
+  useEffect(() => {
+    const inProgressVideos = generations.filter(gen => gen.status === 'in_progress');
+    if (inProgressVideos.length === 0) return;
+
+    const interval = setInterval(() => {
+      setCurrentTime(Date.now());
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [generations]);
+
   const handleGenerate = async () => {
     const mode = getCurrentMode();
     const generationType = detectGenerationType();
@@ -495,7 +630,15 @@ const VideoGenerator = () => {
 
         try {
           const statusResponse = await fetch(`${API_BASE_URL}/generations/${created.id}`);
-          if (!statusResponse.ok) return;
+          if (!statusResponse.ok) {
+            // Only retry if still under max attempts
+            if (attempts < maxAttempts) {
+              setTimeout(poll, pollInterval);
+            } else {
+              setGenerationTimer(null);
+            }
+            return;
+          }
           const statusPayload = await statusResponse.json();
           const updated = mapGeneration(statusPayload.data);
 
@@ -503,9 +646,8 @@ const VideoGenerator = () => {
             prev.map(gen => (gen.id === updated.id ? updated : gen))
           );
 
-          if (updated.status === 'in_progress') {
-            setTimeout(poll, pollInterval);
-          } else {
+          // Stop polling immediately when completed or failed - no more polling needed
+          if (updated.status === 'completed' || updated.status === 'failed') {
             // Stop timer when completed or failed
             setGenerationTimer(null);
 
@@ -513,9 +655,18 @@ const VideoGenerator = () => {
             if (updated.status === 'completed' && tiktokConnected) {
               setTiktokUploadModal({ show: true, video: updated });
             }
+            return; // Stop polling
+          } else if (updated.status === 'in_progress') {
+            // Only continue polling if still in progress
+            setTimeout(poll, pollInterval);
           }
         } catch (error) {
-          setTimeout(poll, pollInterval);
+          // Only retry if still under max attempts
+          if (attempts < maxAttempts) {
+            setTimeout(poll, pollInterval);
+          } else {
+            setGenerationTimer(null);
+          }
         }
       };
 
@@ -527,6 +678,83 @@ const VideoGenerator = () => {
     } finally {
       setIsGenerating(false);
     }
+  };
+
+  // Poll video status for construction stage transition videos
+  const pollVideoStatus = async (videoId) => {
+    const pollInterval = 5000; // 5 seconds
+    const maxAttempts = 120;   // 10 minutes max
+    let attempts = 0;
+
+    const poll = async () => {
+      if (attempts >= maxAttempts) {
+        setVideosProgress(prev => ({ ...prev, [videoId]: 'failed' }));
+        return;
+      }
+      attempts += 1;
+
+      try {
+        const statusResponse = await fetch(`${API_BASE_URL}/generations/${videoId}`);
+        if (!statusResponse.ok) {
+          // Only retry if we haven't exceeded max attempts
+          if (attempts < maxAttempts) {
+            setTimeout(poll, pollInterval);
+          }
+          return;
+        }
+
+        const statusPayload = await statusResponse.json();
+        const updated = mapGeneration(statusPayload.data);
+
+        // Update generations list
+        setGenerations(prev =>
+          prev.map(gen => (gen.id === updated.id ? updated : gen))
+        );
+
+        // Update videos progress
+        setVideosProgress(prev => ({ ...prev, [videoId]: updated.status }));
+
+        // Stop polling if completed or failed - no more polling needed
+        if (updated.status === 'completed') {
+          console.log(`✅ Video ${videoId} completed successfully - stopping poll`);
+          return; // Stop polling
+        } else if (updated.status === 'failed') {
+          console.error(`❌ Video ${videoId} failed:`, updated.errorMessage, '- stopping poll');
+          return; // Stop polling
+        } else if (updated.status === 'in_progress') {
+          // Only continue polling if still in progress
+          setTimeout(poll, pollInterval);
+        }
+      } catch (error) {
+        console.error(`Error polling video ${videoId}:`, error);
+        // Only retry if we haven't exceeded max attempts
+        // Check current status before retrying
+        try {
+          const statusResponse = await fetch(`${API_BASE_URL}/generations/${videoId}`);
+          if (statusResponse.ok) {
+            const statusPayload = await statusResponse.json();
+            const updated = mapGeneration(statusPayload.data);
+            if (updated.status === 'completed' || updated.status === 'failed') {
+              // Already completed or failed, stop polling
+              setVideosProgress(prev => ({ ...prev, [videoId]: updated.status }));
+              return;
+            }
+          }
+        } catch (checkError) {
+          // If check fails, only retry if under max attempts
+          if (attempts < maxAttempts) {
+            setTimeout(poll, pollInterval);
+          }
+          return;
+        }
+        // Retry if still under max attempts
+        if (attempts < maxAttempts) {
+          setTimeout(poll, pollInterval);
+        }
+      }
+    };
+
+    setTimeout(poll, pollInterval);
   };
 
   const handleGenerateConstructionStages = async () => {
@@ -543,6 +771,19 @@ const VideoGenerator = () => {
       return;
     }
 
+    // Validate video model
+    if (!selectedVideoModel) {
+      alert('⚠️ No video model selected. Please select a video model for generating transition videos.');
+      return;
+    }
+
+    // Check if video model supports image-to-video
+    if (selectedVideoModel.capabilities?.supportedFeatures && 
+        !selectedVideoModel.capabilities.supportedFeatures.includes('image-to-video')) {
+      alert(`⚠️ Model "${selectedVideoModel.name}" does not support image-to-video generation.\n\nPlease select a model that supports image-to-video (e.g., Kling O1, Kling 2.6, Veo 3).`);
+      return;
+    }
+
     // Check if image is uploaded (either uploadedImageFile or startFrameFile)
     const imageFile = uploadedImageFile || startFrameFile;
     if (!imageFile) {
@@ -550,9 +791,27 @@ const VideoGenerator = () => {
       return;
     }
 
-    setIsGeneratingStages(true);
+      setIsGeneratingStages(true);
     setConstructionStages(null);
     setStagesProgress({});
+    setVideosProgress({});
+    setMergedVideo(null);
+    setHasAutoMerged(false); // Reset auto-merge flag for new generation
+    
+    // Start timer for construction stages
+    const startTime = Date.now();
+    setConstructionStagesStartTime(startTime);
+    setConstructionStagesElapsedTime(0);
+    
+    // Clear any existing timer
+    if (constructionStagesTimerRef.current) {
+      clearInterval(constructionStagesTimerRef.current);
+    }
+    
+    // Start updating elapsed time every second
+    constructionStagesTimerRef.current = setInterval(() => {
+      setConstructionStagesElapsedTime(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
 
     // Store imageFile reference for use in the callback
     const imageFileRef = imageFile;
@@ -562,6 +821,7 @@ const VideoGenerator = () => {
       const formData = new FormData();
       formData.append('image', imageFileRef);
       formData.append('modelName', selectedModel.name);
+      formData.append('videoModelName', selectedVideoModel?.name || 'Kling O1');
       formData.append('aspectRatio', aspectRatio || '16:9');
 
       const response = await fetch(`${API_BASE_URL}/generations/construction-stages`, {
@@ -609,6 +869,50 @@ const VideoGenerator = () => {
         }
       });
 
+      // Handle videos if they were created
+      if (data.videos && data.videos.length > 0) {
+        console.log(`🎬 ${data.videos.length} transition videos are being generated...`);
+        
+        // Initialize videos progress
+        const videoProgress = {};
+        data.videos.forEach(video => {
+          if (video.generationId) {
+            videoProgress[video.generationId] = video.status;
+            
+            // Add video to generations list with correct status
+            // Use model name from backend (should be "Kling O1" for videos) instead of selectedModel.name
+            const mappedVideo = {
+              id: video.generationId,
+              prompt: `Construction transition: ${video.fromStage} → ${video.toStage}`,
+              model: video.modelName || 'Kling O1',  // Use model name from backend response
+              modelName: video.modelName || 'Kling O1',  // Also store as modelName for consistency
+              duration: '5s',  // 5 seconds per video (2 videos = 10s total)
+              aspectRatio: aspectRatio || '16:9',
+              resolution: resolution || '720p',
+              status: video.status || 'in_progress',  // Use actual status from backend
+              feature: 'image-to-video',
+              createdAt: new Date(),
+              thumbnail: FALLBACK_THUMBNAIL,
+              videoUrl: FALLBACK_THUMBNAIL,
+              errorMessage: video.error || undefined,  // Include error message if failed
+              errorCode: video.error ? 'GENERATION_FAILED' : undefined
+            };
+            setGenerations(prev => [mappedVideo, ...prev]);
+          } else if (video.status === 'failed') {
+            // Even if generationId is empty, log the failure
+            console.error(`❌ Video ${video.videoNumber} failed without generationId:`, video.error);
+          }
+        });
+        setVideosProgress(videoProgress);
+
+        // Start polling for video completion (only for in_progress videos)
+        data.videos.forEach(video => {
+          if (video.generationId && video.status === 'in_progress') {
+            pollVideoStatus(video.generationId);
+          }
+        });
+      }
+
     } catch (error) {
       console.error('Error generating construction stages:', error);
       alert(`Failed to generate construction stages: ${error.message}`);
@@ -619,8 +923,223 @@ const VideoGenerator = () => {
       });
     } finally {
       setIsGeneratingStages(false);
+      // Don't stop timer here - keep it running until all videos are completed and merged
     }
   };
+  
+  // Stop construction stages timer when everything is complete
+  useEffect(() => {
+    // Stop timer if:
+    // 1. Merged video exists (everything is done)
+    // 2. Or construction stages failed
+    if (mergedVideo || (constructionStages && !constructionStages.success)) {
+      if (constructionStagesTimerRef.current) {
+        clearInterval(constructionStagesTimerRef.current);
+        constructionStagesTimerRef.current = null;
+      }
+    }
+    
+    // Cleanup on unmount
+    return () => {
+      if (constructionStagesTimerRef.current) {
+        clearInterval(constructionStagesTimerRef.current);
+      }
+    };
+  }, [mergedVideo, constructionStages]);
+
+  const handleMergeVideos = async (isAutoMerge = false) => {
+    if (!constructionStages || !constructionStages.videos || constructionStages.videos.length === 0) {
+      if (!isAutoMerge) {
+        alert('⚠️ No videos to merge');
+      }
+      return;
+    }
+
+    // Get all completed video IDs in order
+    const completedVideos = constructionStages.videos
+      .filter(video => {
+        const status = videosProgress[video.generationId] || video.status;
+        return status === 'completed' && video.generationId;
+      })
+      .sort((a, b) => a.videoNumber - b.videoNumber); // Sort by video number
+
+    if (completedVideos.length === 0) {
+      if (!isAutoMerge) {
+        alert('⚠️ No completed videos to merge. Please wait for videos to finish generating.');
+      }
+      return;
+    }
+
+    // For auto-merge, only merge if ALL videos are completed
+    if (isAutoMerge && completedVideos.length < constructionStages.videos.length) {
+      return; // Wait for all videos to complete
+    }
+
+    // For manual merge, ask user if not all videos are completed
+    if (!isAutoMerge && completedVideos.length < constructionStages.videos.length) {
+      const notCompleted = constructionStages.videos.length - completedVideos.length;
+      const proceed = confirm(`⚠️ Only ${completedVideos.length} of ${constructionStages.videos.length} videos are completed. ${notCompleted} video(s) are still generating.\n\nDo you want to merge only the completed videos?`);
+      if (!proceed) {
+        return;
+      }
+    }
+
+    setIsMergingVideos(true);
+
+    try {
+      const videoIds = completedVideos.map(v => v.generationId);
+
+      const response = await fetch(`${API_BASE_URL}/generations/construction-stages/merge`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ videoIds })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || data.message || `Failed to merge videos (${response.status})`);
+      }
+
+      // Update merged video state
+      setMergedVideo({
+        generationId: data.generationId,
+        videoUrl: data.videoUrl,
+        thumbnailUrl: data.thumbnailUrl,
+        duration: data.duration,
+        totalDurationSeconds: data.totalDurationSeconds
+      });
+
+      // Add merged video to generations list
+      const mappedMergedVideo = {
+        id: data.generationId,
+        prompt: `Merged Construction Stages Video (${completedVideos.length} videos)`,
+        model: 'Kling O1',
+        duration: data.duration,
+        aspectRatio: aspectRatio || '16:9',
+        resolution: resolution || '720p',
+        status: 'completed',
+        feature: 'image-to-video',
+        createdAt: new Date(),
+        thumbnail: data.thumbnailUrl,
+        videoUrl: data.videoUrl
+      };
+      setGenerations(prev => [mappedMergedVideo, ...prev]);
+
+      // Mark as auto-merged if this was an auto-merge
+      if (isAutoMerge) {
+        setHasAutoMerged(true);
+        console.log(`✅ Auto-merged ${completedVideos.length} videos into one! Duration: ${data.duration}`);
+      } else {
+        alert(`✅ Successfully merged ${completedVideos.length} videos into one!\n\nDuration: ${data.duration}\n\nThe merged video has been added to your generations list.`);
+      }
+    } catch (error) {
+      console.error('Error merging videos:', error);
+      if (!isAutoMerge) {
+        alert(`Failed to merge videos: ${error.message}`);
+      }
+      // Reset auto-merge flag on error so it can retry
+      if (isAutoMerge) {
+        setHasAutoMerged(false);
+      }
+    } finally {
+      setIsMergingVideos(false);
+    }
+  };
+
+  // Auto-merge videos when all videos are completed
+  useEffect(() => {
+    // Only auto-merge if:
+    // 1. Construction stages exist and have videos
+    // 2. Not already merging
+    // 3. Not already auto-merged
+    // 4. All videos are completed
+    if (
+      !constructionStages ||
+      !constructionStages.videos ||
+      constructionStages.videos.length === 0 ||
+      isMergingVideos ||
+      hasAutoMerged ||
+      mergedVideo
+    ) {
+      return;
+    }
+
+    // Check if all videos are completed
+    const allVideos = constructionStages.videos;
+    const completedVideos = allVideos.filter(video => {
+      const status = videosProgress[video.generationId] || video.status;
+      return status === 'completed' && video.generationId;
+    });
+
+    // Only auto-merge if ALL videos are completed
+    if (completedVideos.length === allVideos.length && completedVideos.length > 0) {
+      console.log(`🎬 All ${completedVideos.length} videos completed! Auto-merging...`);
+      
+      // Call merge function directly to avoid dependency issues
+      const performAutoMerge = async () => {
+        setIsMergingVideos(true);
+        
+        try {
+          const videoIds = completedVideos
+            .sort((a, b) => a.videoNumber - b.videoNumber)
+            .map(v => v.generationId);
+
+          const response = await fetch(`${API_BASE_URL}/generations/construction-stages/merge`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ videoIds })
+          });
+
+          const data = await response.json();
+
+          if (!response.ok) {
+            throw new Error(data.error || data.message || `Failed to merge videos (${response.status})`);
+          }
+
+          // Update merged video state
+          setMergedVideo({
+            generationId: data.generationId,
+            videoUrl: data.videoUrl,
+            thumbnailUrl: data.thumbnailUrl,
+            duration: data.duration,
+            totalDurationSeconds: data.totalDurationSeconds
+          });
+
+          // Add merged video to generations list
+          const mappedMergedVideo = {
+            id: data.generationId,
+            prompt: `Merged Construction Stages Video (${completedVideos.length} videos)`,
+            model: 'Kling O1',
+            duration: data.duration,
+            aspectRatio: aspectRatio || '16:9',
+            resolution: resolution || '720p',
+            status: 'completed',
+            feature: 'image-to-video',
+            createdAt: new Date(),
+            thumbnail: data.thumbnailUrl,
+            videoUrl: data.videoUrl
+          };
+          setGenerations(prev => [mappedMergedVideo, ...prev]);
+
+          setHasAutoMerged(true);
+          console.log(`✅ Auto-merged ${completedVideos.length} videos into one! Duration: ${data.duration}`);
+        } catch (error) {
+          console.error('Error auto-merging videos:', error);
+          // Reset auto-merge flag on error so it can retry
+          setHasAutoMerged(false);
+        } finally {
+          setIsMergingVideos(false);
+        }
+      };
+
+      performAutoMerge();
+    }
+  }, [constructionStages, videosProgress, isMergingVideos, hasAutoMerged, mergedVideo, aspectRatio, resolution]);
 
   const handleDeleteVideo = async (videoId, event) => {
     if (event) {
@@ -1086,6 +1605,97 @@ const VideoGenerator = () => {
                       <div className="border-2 border-dashed border-neutral-700 rounded-lg p-6 hover:border-neutral-600 transition-colors text-center">
                         <Upload size={24} className="text-neutral-500 mx-auto mb-2" />
                         <p className="text-sm text-neutral-400">Click to upload image</p>
+                        <p className="text-xs text-neutral-600 mt-1">JPG, PNG, WEBP (max 10MB)</p>
+                      </div>
+                    </label>
+                  )}
+                </div>
+              )}
+
+              {/* End Frame Input - Show when in image-to-video mode (optional) */}
+              {!motionControlEnabled && textMode !== 'text-to-image' && uploadedImageFile && (
+                <div className="bg-neutral-900/50 border border-neutral-800 rounded-xl p-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <Image size={16} className="text-neutral-400" />
+                      <span className="text-sm text-white">End frame</span>
+                      <span className="text-xs text-neutral-500">(Optional)</span>
+                    </div>
+                    {endFrameFile && (
+                      <button 
+                        onClick={() => setEndFrameFile(null)}
+                        className="text-xs text-red-400 hover:text-red-300"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                  {endFrameFile ? (
+                    <div className="flex items-center gap-3 p-3 bg-neutral-800/50 rounded-lg">
+                      <div className="w-16 h-16 bg-neutral-700 rounded overflow-hidden">
+                        <img 
+                          src={URL.createObjectURL(endFrameFile)} 
+                          alt="End frame" 
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-sm text-white">{endFrameFile.name}</p>
+                        <p className="text-xs text-neutral-500">End frame uploaded</p>
+                      </div>
+                    </div>
+                  ) : (
+                    <label className="block cursor-pointer">
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) {
+                            // Validate file size (max 10MB)
+                            const maxSize = 10 * 1024 * 1024; // 10MB in bytes
+                            if (file.size > maxSize) {
+                              console.error('❌ End frame upload failed: File size exceeds 10MB limit', {
+                                fileName: file.name,
+                                fileSize: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
+                                maxSize: '10 MB'
+                              });
+                              alert('⚠️ File size exceeds 10MB limit. Please upload a smaller image.');
+                              e.target.value = ''; // Reset input
+                              return;
+                            }
+                            
+                            // Validate file type
+                            const validTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+                            if (!validTypes.includes(file.type)) {
+                              console.error('❌ End frame upload failed: Invalid file type', {
+                                fileName: file.name,
+                                fileType: file.type,
+                                validTypes: validTypes
+                              });
+                              alert('⚠️ Invalid file type. Please upload JPG, PNG, or WEBP image.');
+                              e.target.value = ''; // Reset input
+                              return;
+                            }
+                            
+                            // Log upload success
+                            const uploadInfo = {
+                              fileName: file.name,
+                              fileSize: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
+                              fileType: file.type,
+                              type: 'end-frame',
+                              mode: currentMode.type,
+                              timestamp: new Date().toISOString()
+                            };
+                            
+                            setEndFrameFile(file);
+                          }
+                        }}
+                      />
+                      <div className="border-2 border-dashed border-neutral-700 rounded-lg p-6 hover:border-neutral-600 transition-colors text-center">
+                        <Upload size={24} className="text-neutral-500 mx-auto mb-2" />
+                        <p className="text-sm text-neutral-400">Click to upload end frame</p>
                         <p className="text-xs text-neutral-600 mt-1">JPG, PNG, WEBP (max 10MB)</p>
                       </div>
                     </label>
@@ -1642,21 +2252,44 @@ const VideoGenerator = () => {
               <div className="flex items-start gap-2">
                 <Info size={16} className="text-teal-400 flex-shrink-0 mt-0.5" />
                 <div className="text-xs text-teal-300">
-                  <strong>Construction Stages Feature:</strong> Automatically generate 6 construction stage images from your uploaded house image, maintaining the same camera angle and composition.
+                  <strong>Construction Stages Feature:</strong> Automatically generate 3 images (3 construction stages) from your uploaded house image, then create 2 transition videos (5s each = 10s total). Maintains the same camera angle and composition throughout. Videos are generated with rate limiting (max 2 concurrent).
                 </div>
               </div>
             </div>
+            
+            {/* Video Model Selector for Construction Stages */}
+            <div className="mb-3">
+              <label className="block text-sm font-medium text-neutral-300 mb-2">
+                Video Model (for transition videos)
+              </label>
+              <VideoModelSelector 
+                models={models.filter(model => 
+                  model.capabilities?.supportedFeatures?.includes('image-to-video') || 
+                  model.capabilities?.supportedFeatures?.includes('text-to-video')
+                )}
+                selectedModel={selectedVideoModel}
+                onModelChange={setSelectedVideoModel}
+              />
+            </div>
+            
             <button 
               onClick={handleGenerateConstructionStages}
               disabled={isGeneratingStages || isGenerating}
               className="w-full bg-teal-500 hover:bg-teal-600 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2 transition-colors"
             >
               <Zap size={18} />
-              <span>{isGeneratingStages ? 'Generating Construction Stages...' : 'Generate Construction Stages (6 Images)'}</span>
+              <span>{isGeneratingStages ? 'Generating Construction Stages...' : '⚡ Generate Construction Stages (3 Images → 2 Videos, 10s)'}</span>
             </button>
-            {isGeneratingStages && (
-              <div className="mt-3 text-sm text-neutral-400 text-center">
-                This will generate 6 construction stage images sequentially. Please wait...
+            {(isGeneratingStages || constructionStagesElapsedTime > 0) && (
+              <div className="mt-3 text-sm text-center">
+                <div className="text-neutral-400 mb-1">
+                  Generating 3 construction stages, then creating 2 transition videos (5s each). This may take a few minutes. Please wait...
+                </div>
+                {constructionStagesElapsedTime > 0 && (
+                  <div className="text-teal-400 font-bold text-lg">
+                    ⏱️ Total Time: {formatTime(constructionStagesElapsedTime)}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1808,25 +2441,62 @@ const VideoGenerator = () => {
             {constructionStages.success ? (
               <div className="space-y-4">
                 <div className="text-sm text-teal-400 mb-4">
-                  ✅ All {constructionStages.stages.length} stages generated successfully!
+                  ✅ All {constructionStages.stages.length} construction stages generated successfully!
+                  {constructionStagesElapsedTime > 0 && (
+                    <div className="mt-2 text-lg font-bold text-cyan-400">
+                      ⏱️ Total Time: {formatTime(constructionStagesElapsedTime)}
+                    </div>
+                  )}
+                  {constructionStages.intermediateImages && constructionStages.intermediateImages.length > 0 && (
+                    <div className="mt-2 text-sm text-blue-400">
+                      🖼️ {constructionStages.intermediateImages.length} intermediate images created for smoother transitions
+                    </div>
+                  )}
+                  <div className="mt-2 text-sm text-cyan-400">
+                    📊 Total: {constructionStages.stages.length} stages + {constructionStages.intermediateImages?.length || 0} intermediate = {constructionStages.stages.length + (constructionStages.intermediateImages?.length || 0)} images
+                  </div>
+                  {constructionStages.videos && constructionStages.videos.length > 0 && (
+                    <div className="mt-2 text-sm text-purple-400">
+                      🎬 {constructionStages.videosSubmitted || constructionStages.videos.length} videos (5s each) are being generated...
+                      {constructionStages.totalVideoDuration ? (
+                        <span className="ml-2">Total: {constructionStages.totalVideoDuration}s ({Math.round(constructionStages.totalVideoDuration / 60 * 10) / 10} min)</span>
+                      ) : (
+                        <span className="ml-2">Total: {(constructionStages.videosSubmitted || constructionStages.videos.length) * 5}s ({Math.round((constructionStages.videosSubmitted || constructionStages.videos.length) * 5 / 60 * 10) / 10} min)</span>
+                      )}
+                    </div>
+                  )}
                 </div>
+                {/* Display all images (stages + intermediate) sorted by stageOrder */}
                 <div className="grid grid-cols-3 gap-3">
-                  {constructionStages.stages
-                    .sort((a, b) => a.stageOrder - b.stageOrder)
-                    .map((stage) => (
-                      <div
+                  {[
+                    ...(constructionStages.stages || []),
+                    ...(constructionStages.intermediateImages || [])
+                  ]
+                    .sort((a, b) => b.stageOrder - a.stageOrder) // Sort descending (8 → 1) for reverse construction
+                    .map((stage) => {
+                      const isIntermediate = constructionStages.intermediateImages?.some(img => img.stageKey === stage.stageKey);
+                      return (
+                        <div
                         key={stage.stageKey}
                         className={`bg-neutral-800/50 rounded-lg p-3 border ${
                           stage.success
-                            ? 'border-teal-500/50'
+                            ? isIntermediate ? 'border-blue-500/50' : 'border-teal-500/50'
                             : 'border-red-500/50'
                         }`}
                       >
-                        <div className="text-xs text-neutral-400 mb-2">
-                          Stage {stage.stageOrder}
+                        <div className="text-xs text-neutral-400 mb-2 flex items-center gap-1">
+                          {isIntermediate ? (
+                            <>
+                              <span className="text-blue-400">🖼️ Intermediate</span>
+                              <span>Stage {stage.stageOrder}</span>
+                            </>
+                          ) : (
+                            <span>Stage {stage.stageOrder}</span>
+                          )}
                         </div>
                         <div className="text-sm font-medium text-white mb-2">
                           {stage.stageKey
+                            .replace(/^intermediate-/, '')
                             .split('-')
                             .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
                             .join(' ')}
@@ -1855,8 +2525,162 @@ const VideoGenerator = () => {
                           </div>
                         )}
                       </div>
-                    ))}
+                      );
+                    })}
                 </div>
+
+                {/* Display videos progress */}
+                {constructionStages.videos && constructionStages.videos.length > 0 && (
+                  <div className="mt-6 pt-6 border-t border-neutral-700">
+                    <h4 className="text-md font-bold mb-3 text-white flex items-center gap-2">
+                      <Video className="w-4 h-4 text-purple-400" />
+                      Transition Videos ({constructionStages.videos.length})
+                    </h4>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {constructionStages.videos
+                        .sort((a, b) => a.videoNumber - b.videoNumber)
+                        .map((video) => {
+                          const videoStatus = videosProgress[video.generationId] || video.status;
+                          return (
+                            <div
+                              key={video.generationId || video.videoNumber}
+                              className="flex items-center gap-3 p-3 bg-neutral-800/50 rounded-lg border border-neutral-700"
+                            >
+                              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-500/20 flex items-center justify-center text-purple-400 font-bold text-sm">
+                                {video.videoNumber}
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="text-sm font-medium text-white truncate">
+                                  Stage {video.fromStageOrder} → Stage {video.toStageOrder}
+                                </div>
+                                <div className="text-xs text-neutral-400 truncate">
+                                  {video.fromStage.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')} → {video.toStage.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
+                                </div>
+                              </div>
+                              <div className="flex-shrink-0">
+                                {videoStatus === 'in_progress' && (
+                                  <span className="text-xs px-2 py-1 bg-yellow-500/20 text-yellow-400 rounded flex items-center gap-1">
+                                    <div className="w-2 h-2 bg-yellow-400 rounded-full animate-pulse"></div>
+                                    Generating...
+                                  </span>
+                                )}
+                                {videoStatus === 'completed' && (
+                                  <span className="text-xs px-2 py-1 bg-green-500/20 text-green-400 rounded">
+                                    ✓ Completed
+                                  </span>
+                                )}
+                                {videoStatus === 'failed' && (
+                                  <span className="text-xs px-2 py-1 bg-red-500/20 text-red-400 rounded">
+                                    ✗ Failed
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                    </div>
+
+                    {/* Merge Videos Button - Only show if not auto-merged */}
+                    {constructionStages.videos && constructionStages.videos.length > 0 && !mergedVideo && (
+                      <div className="mt-4 pt-4 border-t border-neutral-700">
+                        {(() => {
+                          const completedCount = constructionStages.videos.filter(video => {
+                            const status = videosProgress[video.generationId] || video.status;
+                            return status === 'completed';
+                          }).length;
+                          const allCompleted = completedCount === constructionStages.videos.length;
+                          const someCompleted = completedCount > 0;
+
+                          return (
+                            <div>
+                              {isMergingVideos && (
+                                <div className="mb-3 text-sm text-purple-400 text-center">
+                                  🔄 Auto-merging videos... Please wait...
+                                </div>
+                              )}
+                              {allCompleted && !isMergingVideos && (
+                                <div className="mb-3 text-sm text-green-400 text-center">
+                                  ✅ All videos completed! Merging automatically...
+                                </div>
+                              )}
+                              <button
+                                onClick={() => handleMergeVideos(false)}
+                                disabled={isMergingVideos || !someCompleted}
+                                className={`w-full py-3 px-4 rounded-xl font-bold flex items-center justify-center gap-2 transition-colors ${
+                                  allCompleted
+                                    ? 'bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white'
+                                    : someCompleted
+                                    ? 'bg-purple-500/50 hover:bg-purple-500/70 text-white'
+                                    : 'bg-neutral-700 text-neutral-400 cursor-not-allowed'
+                                } ${isMergingVideos ? 'opacity-60 cursor-not-allowed' : ''}`}
+                              >
+                                <Video className="w-5 h-5" />
+                                {isMergingVideos ? (
+                                  <span>Merging Videos...</span>
+                                ) : allCompleted ? (
+                                  <span>🔗 Merge All {constructionStages.videos.length} Videos ({constructionStages.totalVideoDuration || constructionStages.videos.length * 5}s)</span>
+                                ) : someCompleted ? (
+                                  <span>🔗 Merge {completedCount} Completed Videos ({completedCount * 5}s)</span>
+                                ) : (
+                                  <span>Waiting for videos to complete...</span>
+                                )}
+                              </button>
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    )}
+
+                    {/* Merged Video Display */}
+                    {mergedVideo && (
+                      <div className="mt-6 pt-6 border-t border-neutral-700">
+                        <h4 className="text-md font-bold mb-3 text-white flex items-center gap-2">
+                          <Video className="w-4 h-4 text-green-400" />
+                          Merged Video
+                        </h4>
+                        <div className="bg-gradient-to-r from-green-900/20 to-purple-900/20 border border-green-500/30 rounded-lg p-4">
+                          <div className="flex items-center gap-4">
+                            {mergedVideo.thumbnailUrl && (
+                              <div className="relative w-32 h-20 rounded overflow-hidden bg-neutral-700 flex-shrink-0">
+                                <img
+                                  src={mergedVideo.thumbnailUrl}
+                                  alt="Merged video thumbnail"
+                                  className="w-full h-full object-cover"
+                                />
+                                <div className="absolute inset-0 bg-black/30 flex items-center justify-center">
+                                  <Play className="w-8 h-8 text-white" />
+                                </div>
+                              </div>
+                            )}
+                            <div className="flex-1">
+                              <div className="text-sm font-medium text-white mb-1">
+                                Merged Construction Stages Video
+                              </div>
+                              <div className="text-xs text-neutral-400 mb-1">
+                                Video Duration: {mergedVideo.duration} ({mergedVideo.totalDurationSeconds}s)
+                              </div>
+                              {constructionStagesElapsedTime > 0 && (
+                                <div className="text-xs text-cyan-400 mb-2 font-semibold">
+                                  ⏱️ Total Generation Time: {formatTime(constructionStagesElapsedTime)}
+                                </div>
+                              )}
+                              {mergedVideo.videoUrl && (
+                                <a
+                                  href={mergedVideo.videoUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-xs text-green-400 hover:text-green-300 underline"
+                                >
+                                  Open Video →
+                                </a>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             ) : (
               <div className="text-sm text-red-400">
@@ -1903,14 +2727,26 @@ const VideoGenerator = () => {
                                   const response = await fetch(`${API_BASE_URL}/generations/${latestVideo.id}/check-status`, {
                                     method: 'POST'
                                   });
+                                  const payload = await response.json();
                                   if (response.ok) {
-                                    const payload = await response.json();
-                                    const updated = mapGeneration(payload.data);
-                                    setGenerations(prev => prev.map(gen => gen.id === updated.id ? updated : gen));
-                                    setSelectedGeneration(updated);
+                                    if (payload.warning) {
+                                      console.warn('Status check warning:', payload.warning);
+                                      // Still update with current generation data
+                                      const updated = mapGeneration(payload.data);
+                                      setGenerations(prev => prev.map(gen => gen.id === updated.id ? updated : gen));
+                                      setSelectedGeneration(updated);
+                                    } else {
+                                      const updated = mapGeneration(payload.data);
+                                      setGenerations(prev => prev.map(gen => gen.id === updated.id ? updated : gen));
+                                      setSelectedGeneration(updated);
+                                    }
+                                  } else {
+                                    console.error('Failed to check status:', payload.error || payload.message);
+                                    alert(payload.error || payload.message || 'Failed to check video status');
                                   }
                                 } catch (error) {
                                   console.error('Failed to check status:', error);
+                                  alert('Failed to check video status. Please try again.');
                                 }
                               }}
                               className="mt-4 text-xs text-neutral-400 hover:text-lime-400 underline"
@@ -2094,13 +2930,34 @@ const VideoGenerator = () => {
                       {/* Spacer to push date and buttons to bottom */}
                       <div className="flex-1"></div>
 
-                      {/* Date at Bottom */}
-                      <div className="text-sm text-neutral-500 mb-4">
-                        {latestVideo.createdAt.toLocaleDateString('en-US', {
-                          month: 'long',
-                          day: 'numeric',
-                          year: 'numeric'
-                        })}
+                      {/* Date, Time and Waiting Time at Bottom */}
+                      <div className="text-sm text-neutral-500 mb-4 space-y-2">
+                        <div className="flex items-center gap-2">
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                          <div className="flex flex-col">
+                            <span>{formatDateTime(latestVideo.createdAt)}</span>
+                            <span className="text-xs text-neutral-600 mt-0.5">
+                              {formatFullDateTime(latestVideo.createdAt)}
+                            </span>
+                          </div>
+                        </div>
+                        {formatWaitingTime(latestVideo) && (
+                          <div className="flex items-center gap-2 pt-2 border-t border-neutral-800">
+                            <svg className="w-4 h-4 text-lime-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                            </svg>
+                            <div className="flex flex-col">
+                              <span className="text-lime-400 font-medium">
+                                {latestVideo.status === 'in_progress' ? 'Đang chờ' : 'Đã hoàn thành sau'}
+                              </span>
+                              <span className="text-xs text-neutral-400 mt-0.5">
+                                {formatWaitingTime(latestVideo)}
+                              </span>
+                            </div>
+                          </div>
+                        )}
                       </div>
 
                       {/* Action Button at Bottom Right */}
@@ -2346,10 +3203,19 @@ const VideoGenerator = () => {
                                 <span>{gen.resolution}</span>
                                 <span>•</span>
                                 <span>{gen.duration}</span>
+                                {formatWaitingTime(gen) && (
+                                  <>
+                                    <span>•</span>
+                                    <span className="text-lime-400">{formatWaitingTime(gen)}</span>
+                                  </>
+                                )}
                               </div>
-                              <span className="text-xs text-neutral-600">
-                                {gen.createdAt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
-                              </span>
+                              <div className="flex flex-col items-end text-xs text-neutral-600">
+                                <span>{formatDateTime(gen.createdAt)}</span>
+                                <span className="text-[10px] text-neutral-700 mt-0.5">
+                                  {gen.createdAt.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}
+                                </span>
+                              </div>
                             </div>
                           </div>
                         </div>
@@ -2479,7 +3345,15 @@ const VideoGenerator = () => {
                                 </div>
                               </div>
                               <div className="flex items-center justify-between mt-2">
-                                <span className="text-xs text-neutral-500">{gen.model}</span>
+                                <div className="flex items-center gap-2 text-xs text-neutral-500">
+                                  <span>{gen.model}</span>
+                                  {formatWaitingTime(gen) && (
+                                    <>
+                                      <span>•</span>
+                                      <span className="text-lime-400">{formatWaitingTime(gen)}</span>
+                                    </>
+                                  )}
+                                </div>
                                 <span className="text-xs text-neutral-600">
                                   {gen.createdAt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
                                 </span>
@@ -2593,14 +3467,21 @@ const VideoGenerator = () => {
                             const response = await fetch(`${API_BASE_URL}/generations/${historyVideoModal.video.id}/check-status`, {
                               method: 'POST'
                             });
+                            const payload = await response.json();
                             if (response.ok) {
-                              const payload = await response.json();
+                              if (payload.warning) {
+                                console.warn('Status check warning:', payload.warning);
+                              }
                               const updated = mapGeneration(payload.data);
                               setGenerations(prev => prev.map(gen => gen.id === updated.id ? updated : gen));
                               setHistoryVideoModal({ show: true, video: updated });
+                            } else {
+                              console.error('Failed to check status:', payload.error || payload.message);
+                              alert(payload.error || payload.message || 'Failed to check video status');
                             }
                           } catch (error) {
                             console.error('Failed to check status:', error);
+                            alert('Failed to check video status. Please try again.');
                           }
                         }}
                         className="mt-4 text-xs text-neutral-400 hover:text-lime-400 underline"
@@ -2769,13 +3650,34 @@ const VideoGenerator = () => {
                 {/* Spacer to push date and buttons to bottom */}
                 <div className="flex-1"></div>
 
-                {/* Date at Bottom */}
-                <div className="text-sm text-neutral-500 mb-4">
-                  {historyVideoModal.video.createdAt.toLocaleDateString('en-US', {
-                    month: 'long',
-                    day: 'numeric',
-                    year: 'numeric'
-                  })}
+                {/* Date, Time and Waiting Time at Bottom */}
+                <div className="text-sm text-neutral-500 mb-4 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <div className="flex flex-col">
+                      <span>{formatDateTime(historyVideoModal.video.createdAt)}</span>
+                      <span className="text-xs text-neutral-600 mt-0.5">
+                        {formatFullDateTime(historyVideoModal.video.createdAt)}
+                      </span>
+                    </div>
+                  </div>
+                  {formatWaitingTime(historyVideoModal.video) && (
+                    <div className="flex items-center gap-2 pt-2 border-t border-neutral-800">
+                      <svg className="w-4 h-4 text-lime-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                      </svg>
+                      <div className="flex flex-col">
+                        <span className="text-lime-400 font-medium">
+                          {historyVideoModal.video.status === 'in_progress' ? 'Đang chờ' : 'Đã hoàn thành sau'}
+                        </span>
+                        <span className="text-xs text-neutral-400 mt-0.5">
+                          {formatWaitingTime(historyVideoModal.video)}
+                        </span>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Action Button at Bottom Right */}

@@ -19,6 +19,7 @@ export class KlingService {
   private apiKey: string;
   private baseUrl: string;
   private useJWT: boolean;
+  private callbackUrl: string | undefined;
 
   constructor() {
     this.accessKey = process.env.KLING_ACCESS_KEY || "";
@@ -30,6 +31,14 @@ export class KlingService {
       process.env.KLING_BASE_URL ||
       "https://api.klingai.com";
     this.baseUrl = this.normalizeBaseUrl(rawBaseUrl);
+    
+    // OPTIMIZED: Support webhook callback for instant notifications
+    // Set KLING_CALLBACK_URL env var to enable webhook instead of polling
+    // Example: https://your-domain.com/api/v1/webhooks/kling
+    this.callbackUrl = process.env.KLING_CALLBACK_URL;
+    if (this.callbackUrl) {
+      console.log(`✅ Kling webhook enabled: ${this.callbackUrl}`);
+    }
 
     this.useJWT = !!(this.accessKey && this.secretKey);
 
@@ -40,6 +49,13 @@ export class KlingService {
       },
       timeout: 30000
     });
+  }
+  
+  /**
+   * Get the configured callback URL for webhooks
+   */
+  getCallbackUrl(): string | undefined {
+    return this.callbackUrl;
   }
 
   /**
@@ -113,6 +129,11 @@ export class KlingService {
       negative_prompt: "blurry, low quality, distorted, ugly, bad anatomy",
     };
 
+    // OPTIMIZED: Add callback URL for webhook notifications (instant results)
+    if (this.callbackUrl) {
+      request.callback_url = this.callbackUrl;
+    }
+
     // Only add cfg_scale for v1.x models (v2.x doesn't support it)
     if (modelName.includes("v1")) {
       request.cfg_scale = 0.5;
@@ -166,45 +187,163 @@ export class KlingService {
 
   /**
    * Image-to-Video generation using Kling AI
+   * Supports optional end frame (tail frame) for video transitions
+   * 
+   * OPTIMIZED: Uses image_url directly when available (public URLs)
+   * instead of converting to base64, saving significant time
    */
   async generateImageToVideo(params: {
     imageUrl: string;
+    endImageUrl?: string;  // Optional tail frame for transitions
     prompt?: string;
     duration: string;
     aspectRatio: string;
     audioEnabled: boolean;
     modelName?: string;
   }): Promise<KlingGenerationResponse> {
-    // Map duration string to number
-    let durationSeconds = parseInt(params.duration.replace("s", ""));
-    
-    if (durationSeconds < 7.5) {
-      durationSeconds = 5;
-    } else {
-      durationSeconds = 10;
+    // FIX: Validate imageUrl is provided and not empty
+    if (!params.imageUrl || params.imageUrl === null || params.imageUrl === undefined || (typeof params.imageUrl === 'string' && params.imageUrl.trim() === '')) {
+      console.error(`❌ Invalid imageUrl provided:`, { 
+        imageUrl: params.imageUrl, 
+        type: typeof params.imageUrl,
+        isNull: params.imageUrl === null,
+        isUndefined: params.imageUrl === undefined
+      });
+      throw new Error("Image URL is required for image-to-video generation. Please provide a valid image URL.");
     }
     
     const modelName = this.getKlingModelIdentifier(params.modelName);
+    const isKlingO1 = modelName === "kling-video-o1";
 
-    // Convert image URL (local or remote) to base64
-    let imageData: string;
-    try {
-      const base64DataUri = await imageUrlToBase64(params.imageUrl);
-      // Kling API requires raw base64 without data URI prefix
-      imageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
-    } catch (error: any) {
-      console.error(`❌ Failed to convert image to base64:`, error.message);
-      throw new Error(`Failed to convert image to base64: ${error.message}`);
+    // OPTIMIZED: Check if URL is publicly accessible (http/https)
+    // If so, use image_url field directly (much faster than base64 conversion)
+    const isPublicUrl = params.imageUrl && (params.imageUrl.startsWith('http://') || params.imageUrl.startsWith('https://'));
+    
+    let imageData: string | undefined;
+    let imageUrl: string | undefined;
+    
+    // IMPORTANT: When using image_tail_url, Kling API requires the main image to be sent as base64 (image field)
+    // instead of image_url. This is a Kling API requirement.
+    const requiresBase64ForMainImage = params.endImageUrl !== undefined && params.endImageUrl !== null;
+    
+    // Kling O1 may require base64 format instead of URL
+    if (isKlingO1 || requiresBase64ForMainImage) {
+      // For Kling O1 or when using tail image, convert to base64 to ensure compatibility
+      const reason = isKlingO1 ? "Kling O1 detected" : "image_tail_url requires base64 for main image";
+      console.log(`📦 ${reason} - converting image to base64: ${params.imageUrl.substring(0, 50)}...`);
+      try {
+        const base64DataUri = await imageUrlToBase64(params.imageUrl);
+        imageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
+        if (!imageData || imageData.length === 0) {
+          throw new Error("Base64 conversion returned empty data");
+        }
+        console.log(`✅ Image converted to base64 (${imageData.length} chars)`);
+      } catch (error: any) {
+        console.error(`❌ Failed to convert image to base64:`, error.message);
+        throw new Error(`Failed to convert image to base64: ${error.message}`);
+      }
+    } else if (isPublicUrl) {
+      // Use URL directly - this is MUCH faster than base64 conversion
+      imageUrl = params.imageUrl.trim();
+      console.log(`✅ Using direct URL for image: ${imageUrl.substring(0, 50)}...`);
+    } else {
+      // Fallback to base64 for local files or Cloudinary URLs
+      console.log(`📦 Converting image to base64: ${params.imageUrl.substring(0, 50)}...`);
+      try {
+        const base64DataUri = await imageUrlToBase64(params.imageUrl);
+        imageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
+        if (!imageData || imageData.length === 0) {
+          throw new Error("Base64 conversion returned empty data");
+        }
+        console.log(`✅ Image converted to base64 (${imageData.length} chars)`);
+      } catch (error: any) {
+        console.error(`❌ Failed to convert image to base64:`, error.message);
+        throw new Error(`Failed to convert image to base64: ${error.message}`);
+      }
+    }
+
+    // OPTIMIZED: Handle tail image with same URL-first strategy
+    let tailImageData: string | undefined;
+    let tailImageUrl: string | undefined;
+    
+    if (params.endImageUrl) {
+      // Kling O1 requires base64 format for tail image too
+      if (isKlingO1) {
+        try {
+          const base64DataUri = await imageUrlToBase64(params.endImageUrl);
+          tailImageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
+          if (!tailImageData || tailImageData.length === 0) {
+            throw new Error("Base64 conversion returned empty data");
+          }
+        } catch (error: any) {
+          console.error(`❌ Failed to convert tail image to base64 for Kling O1:`, error.message);
+          throw new Error(`Failed to convert tail image to base64: ${error.message}`);
+        }
+      } else {
+        const isTailPublicUrl = params.endImageUrl.startsWith('http://') || params.endImageUrl.startsWith('https://');
+        
+        if (isTailPublicUrl) {
+          tailImageUrl = params.endImageUrl;
+        } else {
+          try {
+            const base64DataUri = await imageUrlToBase64(params.endImageUrl);
+            tailImageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
+          } catch (error: any) {
+            console.error(`❌ Failed to convert tail image to base64:`, error.message);
+            throw new Error(`Failed to convert tail image to base64: ${error.message}`);
+          }
+        }
+      }
+    }
+
+    // Map duration string to number
+    // IMPORTANT: When image_tail is provided, duration MUST be 5 (Kling API requirement)
+    let durationSeconds = parseInt(params.duration.replace("s", ""));
+    
+    if (tailImageData) {
+      // When using tail frame, duration must be 5 seconds
+      durationSeconds = 5;
+    } else {
+      // When no tail frame, use normal duration mapping
+      if (durationSeconds < 7.5) {
+        durationSeconds = 5;
+      } else {
+        durationSeconds = 10;
+      }
     }
 
     const request: any = {
       model: modelName,
-      image: imageData,  // Use "image" field for base64 data (not "image_url")
       prompt: params.prompt,
       duration: durationSeconds,  // Send as number, not string
       aspect_ratio: params.aspectRatio,
       negative_prompt: "blurry, low quality, distorted",
     };
+
+    // OPTIMIZED: Add callback URL for webhook notifications (instant results)
+    if (this.callbackUrl) {
+      request.callback_url = this.callbackUrl;
+    }
+
+    // OPTIMIZED: Use URL directly when available (faster), fallback to base64
+    if (imageUrl && imageUrl.trim() !== '') {
+      request.image_url = imageUrl.trim();  // Use "image_url" for public URLs
+      console.log(`📤 Sending image_url to Kling API: ${imageUrl.substring(0, 50)}...`);
+    } else if (imageData && imageData.length > 0) {
+      request.image = imageData;  // Use "image" field for base64 data
+      console.log(`📤 Sending base64 image data to Kling API (${imageData.length} chars)`);
+    } else {
+      // CRITICAL: Ensure image is always provided
+      console.error(`❌ Image processing failed: imageUrl="${imageUrl}", imageData length=${imageData?.length || 0}`);
+      throw new Error("Failed to process image: neither image_url nor image data could be generated. Please check that the image URL is valid and accessible.");
+    }
+
+    // Add tail frame if provided (URL or base64)
+    if (tailImageUrl) {
+      request.image_tail_url = tailImageUrl;  // Use URL for tail frame
+    } else if (tailImageData) {
+      request.image_tail = tailImageData;  // Use base64 for tail frame
+    }
 
     // Only add cfg_scale for v1.x models (v2.x doesn't support it)
     if (modelName.includes("v1")) {
@@ -215,6 +354,19 @@ export class KlingService {
     if ((modelName === "kling-v2.6-pro" || modelName === "kling-v2.6-std") && params.audioEnabled) {
       request.sound = "on";
     }
+
+    // Debug: Log request structure (without sensitive data)
+    const requestDebug = { ...request };
+    if (requestDebug.image) {
+      requestDebug.image = `[base64 data: ${requestDebug.image.length} chars]`;
+    }
+    if (requestDebug.image_tail) {
+      requestDebug.image_tail = `[base64 data: ${requestDebug.image_tail.length} chars]`;
+    }
+    if (requestDebug.image_tail_url) {
+      requestDebug.image_tail_url = `[URL: ${requestDebug.image_tail_url.substring(0, 50)}...]`;
+    }
+    console.log(`🚀 Sending image2video request to Kling API:`, JSON.stringify(requestDebug, null, 2));
 
     try {
       const response = await this.client.post<KlingGenerationResponse>(
@@ -293,6 +445,11 @@ export class KlingService {
       aspect_ratio: params.aspectRatio,
       negative_prompt: "blurry, low quality, distorted",
     };
+
+    // OPTIMIZED: Add callback URL for webhook notifications (instant results)
+    if (this.callbackUrl) {
+      request.callback_url = this.callbackUrl;
+    }
 
     // Kling O1 uses video_url field (must be publicly accessible URL)
     if (isKlingO1) {
@@ -422,6 +579,11 @@ export class KlingService {
       mode: params.resolution === "1080p" ? "pro" : "std"
     };
 
+    // OPTIMIZED: Add callback URL for webhook notifications (instant results)
+    if (this.callbackUrl) {
+      request.callback_url = this.callbackUrl;
+    }
+
     try {
       const response = await this.client.post<KlingGenerationResponse>(
         "/v1/videos/motion-control",
@@ -482,6 +644,11 @@ export class KlingService {
         n: 1
       };
 
+      // OPTIMIZED: Add callback URL for webhook notifications (instant results)
+      if (this.callbackUrl) {
+        request.callback_url = this.callbackUrl;
+      }
+
       try {
         const response = await this.client.post<KlingGenerationResponse>(
           "/v1/images/omni-image",
@@ -531,6 +698,11 @@ export class KlingService {
       negative_prompt: "blurry, low quality, distorted, ugly, bad anatomy"
     };
 
+    // OPTIMIZED: Add callback URL for webhook notifications (instant results)
+    if (this.callbackUrl) {
+      request.callback_url = this.callbackUrl;
+    }
+
     try {
       const response = await this.client.post<KlingGenerationResponse>(
         "/v1/images/omni-image",
@@ -572,6 +744,9 @@ export class KlingService {
 
   /**
    * Image-to-Image generation using Kling AI
+   * 
+   * OPTIMIZED: Uses image_url directly when available (public URLs)
+   * instead of converting to base64, saving significant time
    */
   async generateImageToImage(params: {
     imageUrl: string;
@@ -583,25 +758,47 @@ export class KlingService {
     const modelName = this.getKlingModelIdentifier(params.modelName, "image-to-image");
     const isKlingO1 = modelName === "kling-image-o1";
 
-    let imageData: string;
-    try {
-      const base64DataUri = await imageUrlToBase64(params.imageUrl);
-      // Kling API requires raw base64 without data URI prefix
-      imageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
-    } catch (error: any) {
-      console.error(`❌ Failed to convert image to base64:`, error.message);
-      throw new Error(`Failed to convert image to base64: ${error.message}`);
+    // OPTIMIZED: Check if URL is publicly accessible
+    const isPublicUrl = params.imageUrl.startsWith('http://') || params.imageUrl.startsWith('https://');
+    
+    let imageData: string | undefined;
+    let imageUrl: string | undefined;
+    
+    if (isPublicUrl) {
+      // Use URL directly - this is MUCH faster than base64 conversion
+      imageUrl = params.imageUrl;
+      console.log(`✅ Using direct URL for image-to-image (faster)`);
+    } else {
+      // Fallback to base64 for local files
+      try {
+        const base64DataUri = await imageUrlToBase64(params.imageUrl);
+        imageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
+      } catch (error: any) {
+        console.error(`❌ Failed to convert image to base64:`, error.message);
+        throw new Error(`Failed to convert image to base64: ${error.message}`);
+      }
     }
 
     const request: any = {
       model_name: modelName,
       prompt: params.prompt,
-      image: imageData,
       aspect_ratio: params.aspectRatio === "auto" ? "auto" : params.aspectRatio,
       resolution: "1k",
       n: 1,
       strength: params.strength ?? 0.7
     };
+
+    // OPTIMIZED: Add callback URL for webhook notifications (instant results)
+    if (this.callbackUrl) {
+      request.callback_url = this.callbackUrl;
+    }
+
+    // OPTIMIZED: Use URL directly when available
+    if (imageUrl) {
+      request.image_url = imageUrl;
+    } else if (imageData) {
+      request.image = imageData;
+    }
 
     try {
       const response = await this.client.post<KlingGenerationResponse>(

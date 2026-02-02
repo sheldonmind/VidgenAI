@@ -260,3 +260,93 @@ export const videoUrlToBase64 = (videoUrl: string): string => {
     throw new Error(`Failed to convert video to base64: ${error.message}`);
   }
 };
+
+/**
+ * Merge multiple video files into one using ffmpeg
+ * @param videoFilenames - Array of video filenames in uploads directory (in order)
+ * @returns Filename of the merged video
+ */
+export const mergeVideos = async (
+  videoFilenames: string[]
+): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    try {
+      if (videoFilenames.length === 0) {
+        reject(new Error("No videos to merge"));
+        return;
+      }
+
+      if (videoFilenames.length === 1) {
+        // If only one video, return it as-is
+        resolve(videoFilenames[0]);
+        return;
+      }
+
+      ensureUploadsDir();
+
+      // Create a temporary file list for ffmpeg concat
+      const listFilename = `${uuid()}.txt`;
+      const listPath = path.join(uploadsDir, listFilename);
+      
+      // Write file list for concat demuxer
+      const fileList = videoFilenames
+        .map((filename) => {
+          const videoPath = path.join(uploadsDir, filename);
+          if (!fs.existsSync(videoPath)) {
+            throw new Error(`Video file not found: ${videoPath}`);
+          }
+          // Use absolute path and escape single quotes for ffmpeg
+          return `file '${videoPath.replace(/'/g, "'\\''")}'`;
+        })
+        .join("\n");
+
+      fs.writeFileSync(listPath, fileList);
+
+      // Output filename
+      const outputFilename = `merged-${uuid()}.mp4`;
+      const outputPath = path.join(uploadsDir, outputFilename);
+
+      // Use concat demuxer for better compatibility
+      ffmpeg()
+        .input(listPath)
+        .inputOptions(["-f", "concat", "-safe", "0"])
+        .outputOptions([
+          "-c", "copy", // Copy codecs (no re-encoding, faster)
+          "-movflags", "+faststart" // Optimize for web streaming
+        ])
+        .output(outputPath)
+        .on("start", (commandLine) => {
+          console.log(`🎬 Merging ${videoFilenames.length} videos...`);
+          console.log(`FFmpeg command: ${commandLine}`);
+        })
+        .on("end", () => {
+          // Clean up temporary list file
+          try {
+            if (fs.existsSync(listPath)) {
+              fs.unlinkSync(listPath);
+            }
+          } catch (cleanupError) {
+            console.warn("Failed to cleanup temp list file:", cleanupError);
+          }
+          
+          console.log(`✅ Successfully merged ${videoFilenames.length} videos into ${outputFilename}`);
+          resolve(outputFilename);
+        })
+        .on("error", (err) => {
+          // Clean up temporary list file
+          try {
+            if (fs.existsSync(listPath)) {
+              fs.unlinkSync(listPath);
+            }
+          } catch (cleanupError) {
+            console.warn("Failed to cleanup temp list file:", cleanupError);
+          }
+          
+          reject(new Error(`Failed to merge videos: ${err.message}`));
+        })
+        .run();
+    } catch (error: any) {
+      reject(new Error(`Failed to merge videos: ${error.message}`));
+    }
+  });
+};

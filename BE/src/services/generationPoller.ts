@@ -13,7 +13,9 @@ import path from "path";
  */
 
 let pollingInterval: NodeJS.Timeout | null = null;
-const POLLING_INTERVAL_MS = 60000; // Check every 60 seconds (reduced API costs by 50%)
+// OPTIMIZED: Reduced from 60s to 10s for faster status updates
+// Higgsfield likely uses 2-5s intervals or webhooks for instant updates
+const POLLING_INTERVAL_MS = 10000; // Check every 10 seconds
 const activePolls = new Set<string>(); // Track which generations are currently being polled
 
 /**
@@ -185,30 +187,50 @@ async function pollKlingGeneration(generationId: string, taskId: string, generat
           prompt = generation?.prompt || null;
           
           try {
-            // Download video from Kling
-            const videoFilename = await downloadAndSaveVideo(videoUrl, undefined);
+            // OPTIMIZED: Download video and thumbnail in PARALLEL for faster processing
+            // This can save 5-15 seconds depending on file sizes
+            console.log(`⚡ Starting parallel download of video and thumbnail...`);
+            const startTime = Date.now();
             
-            // Upload video to Cloudinary (REQUIRED - no fallback)
-            const cloudinaryVideoUrl = await uploadLocalFileToCloudinary(videoFilename, 'video');
-            finalLocalVideoUrl = cloudinaryVideoUrl;
-
-            // Download or generate thumbnail
-            let cloudinaryThumbnailUrl: string;
-            if (thumbnailUrl) {
-              // If Kling provides cover_url, download it
-              try {
-                const thumbnailFilename = await downloadAndSaveThumbnail(thumbnailUrl, undefined);
-                cloudinaryThumbnailUrl = await uploadLocalFileToCloudinary(thumbnailFilename, 'image');
-              } catch (thumbError: any) {
-                // Fallback: generate thumbnail from video
-                const thumbnailFilename = await generateVideoThumbnail(videoFilename);
-                cloudinaryThumbnailUrl = await uploadLocalFileToCloudinary(thumbnailFilename, 'image');
-              }
+            // Start video download
+            const videoDownloadPromise = downloadAndSaveVideo(videoUrl, undefined);
+            
+            // Start thumbnail download in parallel (if URL provided)
+            const thumbnailDownloadPromise = thumbnailUrl 
+              ? downloadAndSaveThumbnail(thumbnailUrl, undefined).catch(() => null)
+              : Promise.resolve(null);
+            
+            // Wait for both to complete
+            const [videoFilename, thumbnailFilename] = await Promise.all([
+              videoDownloadPromise,
+              thumbnailDownloadPromise
+            ]);
+            
+            console.log(`⚡ Parallel download completed in ${Date.now() - startTime}ms`);
+            
+            // OPTIMIZED: Upload video and thumbnail in PARALLEL
+            const uploadStartTime = Date.now();
+            
+            const videoUploadPromise = uploadLocalFileToCloudinary(videoFilename, 'video');
+            
+            // Determine thumbnail source and upload
+            let thumbnailUploadPromise: Promise<string>;
+            if (thumbnailFilename) {
+              thumbnailUploadPromise = uploadLocalFileToCloudinary(thumbnailFilename, 'image');
             } else {
-              // If no cover_url from Kling, generate thumbnail from video
-              const thumbnailFilename = await generateVideoThumbnail(videoFilename);
-              cloudinaryThumbnailUrl = await uploadLocalFileToCloudinary(thumbnailFilename, 'image');
+              // Generate thumbnail from video if not available
+              const genThumbFilename = await generateVideoThumbnail(videoFilename);
+              thumbnailUploadPromise = uploadLocalFileToCloudinary(genThumbFilename, 'image');
             }
+            
+            // Wait for both uploads to complete
+            const [cloudinaryVideoUrl, cloudinaryThumbnailUrl] = await Promise.all([
+              videoUploadPromise,
+              thumbnailUploadPromise
+            ]);
+            
+            console.log(`⚡ Parallel upload completed in ${Date.now() - uploadStartTime}ms`);
+            finalLocalVideoUrl = cloudinaryVideoUrl;
 
             await prisma.generation.update({
               where: { id: generationId },
@@ -465,6 +487,17 @@ async function checkPendingGenerations(): Promise<number> {
     if (pendingGenerations.length > 0) {
       for (const gen of pendingGenerations) {
         if (gen.providerJobId) {
+          // Double-check status before polling - skip if already completed or failed
+          const currentGen = await prisma.generation.findUnique({
+            where: { id: gen.id },
+            select: { status: true }
+          });
+          
+          if (currentGen?.status !== "in_progress") {
+            // Generation already completed or failed, skip polling
+            continue;
+          }
+          
           const ageMinutes = (Date.now() - gen.createdAt.getTime()) / (1000 * 60);
           if (ageMinutes > 30) {
             await prisma.generation.update({
