@@ -12,7 +12,9 @@
     "prisma:studio": "prisma studio",
     "prisma:seed": "tsx prisma/seed.ts",
     "seed": "tsx prisma/seed.ts",
-    "clean:uploads": "tsx src/scripts/cleanUploads.ts"
+    "clean:uploads": "tsx src/scripts/cleanUploads.ts",
+    "tiktok-login": "tsx src/scripts/tiktok-login-browser.ts",
+    "test:cloudinary-fallback": "tsx test-cloudinary-fallback.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
@@ -28,6 +30,7 @@
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.0",
     "multer": "^1.4.5-lts.1",
+    "playwright": "^1.58.1",
     "uuid": "^9.0.1",
     "zod": "^3.23.8"
   },
@@ -36,7 +39,7 @@
     "@types/express": "^4.17.21",
     "@types/morgan": "^1.9.9",
     "@types/multer": "^1.4.11",
-    "@types/node": "^20.14.10",
+    "@types/node": "^20.19.31",
     "@types/uuid": "^11.0.0",
     "prisma": "^5.22.0",
     "tsx": "^4.16.2",

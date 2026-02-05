@@ -1,6 +1,7 @@
 import prisma from "../prisma";
 import { veo3Service } from "./veo3Service";
 import { klingService } from "./klingService";
+import { imagenService } from "./imagenService";
 import { tiktokService } from "./tiktokService";
 import { downloadAndSaveVideo, downloadAndSaveThumbnail, generateVideoThumbnail } from "../utils/storage";
 import { uploadLocalFileToCloudinary } from "./cloudinaryService";
@@ -12,7 +13,9 @@ import path from "path";
  */
 
 let pollingInterval: NodeJS.Timeout | null = null;
-const POLLING_INTERVAL_MS = 60000; // Check every 60 seconds (reduced API costs by 50%)
+// OPTIMIZED: Reduced from 60s to 10s for faster status updates
+// Higgsfield likely uses 2-5s intervals or webhooks for instant updates
+const POLLING_INTERVAL_MS = 10000; // Check every 10 seconds
 const activePolls = new Set<string>(); // Track which generations are currently being polled
 
 /**
@@ -20,6 +23,15 @@ const activePolls = new Set<string>(); // Track which generations are currently 
  */
 function isKlingModel(modelName: string | null): boolean {
   return modelName?.toLowerCase().includes('kling') ?? false;
+}
+
+/**
+ * Determine if a generation is using Imagen based on model name
+ */
+function isImagenModel(modelName: string | null): boolean {
+  if (!modelName) return false;
+  const lowerName = modelName.toLowerCase();
+  return lowerName.includes('imagen');
 }
 
 /**
@@ -175,30 +187,50 @@ async function pollKlingGeneration(generationId: string, taskId: string, generat
           prompt = generation?.prompt || null;
           
           try {
-            // Download video from Kling
-            const videoFilename = await downloadAndSaveVideo(videoUrl, undefined);
+            // OPTIMIZED: Download video and thumbnail in PARALLEL for faster processing
+            // This can save 5-15 seconds depending on file sizes
+            console.log(`⚡ Starting parallel download of video and thumbnail...`);
+            const startTime = Date.now();
             
-            // Upload video to Cloudinary (REQUIRED - no fallback)
-            const cloudinaryVideoUrl = await uploadLocalFileToCloudinary(videoFilename, 'video');
-            finalLocalVideoUrl = cloudinaryVideoUrl;
-
-            // Download or generate thumbnail
-            let cloudinaryThumbnailUrl: string;
-            if (thumbnailUrl) {
-              // If Kling provides cover_url, download it
-              try {
-                const thumbnailFilename = await downloadAndSaveThumbnail(thumbnailUrl, undefined);
-                cloudinaryThumbnailUrl = await uploadLocalFileToCloudinary(thumbnailFilename, 'image');
-              } catch (thumbError: any) {
-                // Fallback: generate thumbnail from video
-                const thumbnailFilename = await generateVideoThumbnail(videoFilename);
-                cloudinaryThumbnailUrl = await uploadLocalFileToCloudinary(thumbnailFilename, 'image');
-              }
+            // Start video download
+            const videoDownloadPromise = downloadAndSaveVideo(videoUrl, undefined);
+            
+            // Start thumbnail download in parallel (if URL provided)
+            const thumbnailDownloadPromise = thumbnailUrl 
+              ? downloadAndSaveThumbnail(thumbnailUrl, undefined).catch(() => null)
+              : Promise.resolve(null);
+            
+            // Wait for both to complete
+            const [videoFilename, thumbnailFilename] = await Promise.all([
+              videoDownloadPromise,
+              thumbnailDownloadPromise
+            ]);
+            
+            console.log(`⚡ Parallel download completed in ${Date.now() - startTime}ms`);
+            
+            // OPTIMIZED: Upload video and thumbnail in PARALLEL
+            const uploadStartTime = Date.now();
+            
+            const videoUploadPromise = uploadLocalFileToCloudinary(videoFilename, 'video');
+            
+            // Determine thumbnail source and upload
+            let thumbnailUploadPromise: Promise<string>;
+            if (thumbnailFilename) {
+              thumbnailUploadPromise = uploadLocalFileToCloudinary(thumbnailFilename, 'image');
             } else {
-              // If no cover_url from Kling, generate thumbnail from video
-              const thumbnailFilename = await generateVideoThumbnail(videoFilename);
-              cloudinaryThumbnailUrl = await uploadLocalFileToCloudinary(thumbnailFilename, 'image');
+              // Generate thumbnail from video if not available
+              const genThumbFilename = await generateVideoThumbnail(videoFilename);
+              thumbnailUploadPromise = uploadLocalFileToCloudinary(genThumbFilename, 'image');
             }
+            
+            // Wait for both uploads to complete
+            const [cloudinaryVideoUrl, cloudinaryThumbnailUrl] = await Promise.all([
+              videoUploadPromise,
+              thumbnailUploadPromise
+            ]);
+            
+            console.log(`⚡ Parallel upload completed in ${Date.now() - uploadStartTime}ms`);
+            finalLocalVideoUrl = cloudinaryVideoUrl;
 
             await prisma.generation.update({
               where: { id: generationId },
@@ -326,6 +358,83 @@ async function pollVeo3Generation(generationId: string, operationName: string) {
 }
 
 /**
+ * Poll a single Imagen generation
+ */
+async function pollImagenGeneration(generationId: string, operationName: string) {
+  try {
+    const status = await imagenService.checkGenerationStatus(operationName);
+
+    if (status.done) {
+      if (status.error) {
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "failed",
+            updatedAt: new Date()
+          }
+        });
+      } else {
+        const imageUrl = imagenService.extractImageUrl(status);
+
+        if (imageUrl) {
+          try {
+            let cloudinaryImageUrl: string;
+            
+            if (imageUrl.startsWith('data:')) {
+              // Convert base64 data URI to file and upload
+              const base64Data = imageUrl.split(',')[1];
+              const buffer = Buffer.from(base64Data, 'base64');
+              const filename = `imagen-${Date.now()}.png`;
+              const fs = await import('fs/promises');
+              const uploadsDir = path.join(process.cwd(), 'uploads');
+              await fs.mkdir(uploadsDir, { recursive: true });
+              const filepath = path.join(uploadsDir, filename);
+              await fs.writeFile(filepath, buffer);
+              
+              cloudinaryImageUrl = await uploadLocalFileToCloudinary(filename, 'image');
+            } else {
+              // Download from URL
+              const imageFilename = await downloadAndSaveThumbnail(imageUrl, process.env.GOOGLE_API_KEY);
+              cloudinaryImageUrl = await uploadLocalFileToCloudinary(imageFilename, 'image');
+            }
+            
+            await prisma.generation.update({
+              where: { id: generationId },
+              data: {
+                status: "completed",
+                imageUrl: cloudinaryImageUrl,
+                thumbnailUrl: cloudinaryImageUrl,
+                updatedAt: new Date()
+              } as any
+            });
+          } catch (downloadError: any) {
+            await prisma.generation.update({
+              where: { id: generationId },
+              data: {
+                status: "failed",
+                errorMessage: `Failed to upload image to Cloudinary: ${downloadError.message}`,
+                updatedAt: new Date()
+              }
+            });
+          }
+        } else {
+          await prisma.generation.update({
+            where: { id: generationId },
+            data: {
+              status: "failed",
+              errorMessage: "No image URL returned from provider",
+              updatedAt: new Date()
+            }
+          });
+        }
+      }
+    }
+  } catch (error: any) {
+    throw error;
+  }
+}
+
+/**
  * Poll a single generation (routes to appropriate provider)
  */
 async function pollGeneration(generationId: string, operationName: string, modelName: string | null, generationType: string) {
@@ -336,7 +445,9 @@ async function pollGeneration(generationId: string, operationName: string, model
   activePolls.add(generationId);
 
   try {
-    if (isKlingModel(modelName)) {
+    if (isImagenModel(modelName)) {
+      await pollImagenGeneration(generationId, operationName);
+    } else if (isKlingModel(modelName)) {
       await pollKlingGeneration(generationId, operationName, generationType);
     } else {
       await pollVeo3Generation(generationId, operationName);
@@ -376,6 +487,17 @@ async function checkPendingGenerations(): Promise<number> {
     if (pendingGenerations.length > 0) {
       for (const gen of pendingGenerations) {
         if (gen.providerJobId) {
+          // Double-check status before polling - skip if already completed or failed
+          const currentGen = await prisma.generation.findUnique({
+            where: { id: gen.id },
+            select: { status: true }
+          });
+          
+          if (currentGen?.status !== "in_progress") {
+            // Generation already completed or failed, skip polling
+            continue;
+          }
+          
           const ageMinutes = (Date.now() - gen.createdAt.getTime()) / (1000 * 60);
           if (ageMinutes > 30) {
             await prisma.generation.update({

@@ -1,4 +1,5 @@
 import { PrismaClient } from "@prisma/client";
+import { randomUUID } from "crypto";
 
 const prisma = new PrismaClient();
 
@@ -15,6 +16,28 @@ const MODELS = [
   {
     name: "Veo 3 Fast",
     category: "GENERAL"
+  },
+  // Google Imagen 4 Models
+  {
+    name: "Imagen 4",
+    category: "GENERAL"
+  },
+  {
+    name: "Imagen 4 Fast",
+    category: "GENERAL"
+  },
+  {
+    name: "Imagen 4 Ultra",
+    category: "ADVANCED"
+  },
+  // Google Gemini Image Models (Nano Banana)
+  {
+    name: "Nano Banana",
+    category: "GENERAL"
+  },
+  {
+    name: "Nano Banana Pro",
+    category: "ADVANCED"
   },
   // KLing AI Models
   {
@@ -48,7 +71,10 @@ async function main() {
         }
       },
       update: {},
-      create: modelData
+      create: {
+        id: randomUUID(),
+        ...modelData
+      }
     });
     console.log(`✅ Model created/updated: ${model.name} (${model.category})`);
   }

@@ -27,7 +27,8 @@ export const MODEL_CAPABILITIES: Record<string, ModelCapability> = {
     supportsAudio: true,
     defaultDuration: "6s",
     defaultAspectRatio: "16:9",
-    defaultResolution: "720p"
+    defaultResolution: "720p",
+    supportedFeatures: ["text-to-video", "image-to-video"]
   },
   "Veo 3.1": {
     name: "Veo 3.1",
@@ -38,7 +39,8 @@ export const MODEL_CAPABILITIES: Record<string, ModelCapability> = {
     supportsAudio: true,
     defaultDuration: "6s",
     defaultAspectRatio: "16:9",
-    defaultResolution: "720p"
+    defaultResolution: "720p",
+    supportedFeatures: ["text-to-video", "image-to-video"]
   },
   "Veo 3 Fast": {
     name: "Veo 3 Fast",
@@ -49,7 +51,8 @@ export const MODEL_CAPABILITIES: Record<string, ModelCapability> = {
     supportsAudio: true,
     defaultDuration: "4s",
     defaultAspectRatio: "16:9",
-    defaultResolution: "720p"
+    defaultResolution: "720p",
+    supportedFeatures: ["text-to-video", "image-to-video"]
   },
   
   // Kling AI Models
@@ -100,6 +103,66 @@ export const MODEL_CAPABILITIES: Record<string, ModelCapability> = {
     defaultAspectRatio: "16:9",
     defaultResolution: "720p",
     supportedFeatures: ["text-to-video", "image-to-video", "video-to-video", "text-to-image", "image-to-image"]
+  },
+  "Imagen 4": {
+    name: "Imagen 4",
+    provider: "google",
+    durations: ["0s"],
+    aspectRatios: ["1:1", "16:9", "9:16", "4:3", "3:4"],
+    resolutions: ["720p", "1080p"],
+    supportsAudio: false,
+    defaultDuration: "0s",
+    defaultAspectRatio: "16:9",
+    defaultResolution: "1080p",
+    supportedFeatures: ["text-to-image", "image-to-image"]
+  },
+  "Imagen 4 Fast": {
+    name: "Imagen 4 Fast",
+    provider: "google",
+    durations: ["0s"],
+    aspectRatios: ["1:1", "16:9", "9:16", "4:3", "3:4"],
+    resolutions: ["720p", "1080p"],
+    supportsAudio: false,
+    defaultDuration: "0s",
+    defaultAspectRatio: "16:9",
+    defaultResolution: "1080p",
+    supportedFeatures: ["text-to-image", "image-to-image"]
+  },
+  "Imagen 4 Ultra": {
+    name: "Imagen 4 Ultra",
+    provider: "google",
+    durations: ["0s"],
+    aspectRatios: ["1:1", "16:9", "9:16", "4:3", "3:4"],
+    resolutions: ["1080p", "2160p"],
+    supportsAudio: false,
+    defaultDuration: "0s",
+    defaultAspectRatio: "16:9",
+    defaultResolution: "2160p",
+    supportedFeatures: ["text-to-image", "image-to-image"]
+  },
+  "Nano Banana": {
+    name: "Nano Banana",
+    provider: "google",
+    durations: ["0s"],
+    aspectRatios: ["1:1", "16:9", "9:16", "4:3", "3:4"],
+    resolutions: ["720p", "1080p"],
+    supportsAudio: false,
+    defaultDuration: "0s",
+    defaultAspectRatio: "16:9",
+    defaultResolution: "1080p",
+    supportedFeatures: ["text-to-image", "image-to-image"]
+  },
+  "Nano Banana Pro": {
+    name: "Nano Banana Pro",
+    provider: "google",
+    durations: ["0s"],
+    aspectRatios: ["1:1", "16:9", "9:16", "4:3", "3:4"],
+    resolutions: ["1080p", "2160p"],
+    supportsAudio: false,
+    defaultDuration: "0s",
+    defaultAspectRatio: "16:9",
+    defaultResolution: "1080p",
+    supportedFeatures: ["text-to-image", "image-to-image"]
   }
 };
 
