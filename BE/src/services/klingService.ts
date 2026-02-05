@@ -47,7 +47,7 @@ export class KlingService {
       headers: {
         "Content-Type": "application/json"
       },
-      timeout: 30000
+      timeout: 120000 // Increased to 120s for large requests with base64 images
     });
   }
   
@@ -212,82 +212,133 @@ export class KlingService {
       throw new Error("Image URL is required for image-to-video generation. Please provide a valid image URL.");
     }
     
+    // Trim and validate imageUrl
+    const trimmedImageUrl = params.imageUrl.trim();
+    if (trimmedImageUrl === '') {
+      throw new Error("Image URL cannot be empty. Please provide a valid image URL.");
+    }
+    
     const modelName = this.getKlingModelIdentifier(params.modelName);
     const isKlingO1 = modelName === "kling-video-o1";
 
     // OPTIMIZED: Check if URL is publicly accessible (http/https)
     // If so, use image_url field directly (much faster than base64 conversion)
-    const isPublicUrl = params.imageUrl && (params.imageUrl.startsWith('http://') || params.imageUrl.startsWith('https://'));
+    const isPublicUrl = trimmedImageUrl.startsWith('http://') || trimmedImageUrl.startsWith('https://');
     
     let imageData: string | undefined;
     let imageUrl: string | undefined;
-    
-    // IMPORTANT: When using image_tail_url, Kling API requires the main image to be sent as base64 (image field)
-    // instead of image_url. This is a Kling API requirement.
-    const requiresBase64ForMainImage = params.endImageUrl !== undefined && params.endImageUrl !== null;
-    
-    // Kling O1 may require base64 format instead of URL
-    if (isKlingO1 || requiresBase64ForMainImage) {
-      // For Kling O1 or when using tail image, convert to base64 to ensure compatibility
-      const reason = isKlingO1 ? "Kling O1 detected" : "image_tail_url requires base64 for main image";
-      console.log(`📦 ${reason} - converting image to base64: ${params.imageUrl.substring(0, 50)}...`);
-      try {
-        const base64DataUri = await imageUrlToBase64(params.imageUrl);
-        imageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
-        if (!imageData || imageData.length === 0) {
-          throw new Error("Base64 conversion returned empty data");
-        }
-        console.log(`✅ Image converted to base64 (${imageData.length} chars)`);
-      } catch (error: any) {
-        console.error(`❌ Failed to convert image to base64:`, error.message);
-        throw new Error(`Failed to convert image to base64: ${error.message}`);
-      }
-    } else if (isPublicUrl) {
-      // Use URL directly - this is MUCH faster than base64 conversion
-      imageUrl = params.imageUrl.trim();
-      console.log(`✅ Using direct URL for image: ${imageUrl.substring(0, 50)}...`);
-    } else {
-      // Fallback to base64 for local files or Cloudinary URLs
-      console.log(`📦 Converting image to base64: ${params.imageUrl.substring(0, 50)}...`);
-      try {
-        const base64DataUri = await imageUrlToBase64(params.imageUrl);
-        imageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
-        if (!imageData || imageData.length === 0) {
-          throw new Error("Base64 conversion returned empty data");
-        }
-        console.log(`✅ Image converted to base64 (${imageData.length} chars)`);
-      } catch (error: any) {
-        console.error(`❌ Failed to convert image to base64:`, error.message);
-        throw new Error(`Failed to convert image to base64: ${error.message}`);
-      }
-    }
-
-    // OPTIMIZED: Handle tail image with same URL-first strategy
     let tailImageData: string | undefined;
     let tailImageUrl: string | undefined;
     
-    if (params.endImageUrl) {
-      // Kling O1 requires base64 format for tail image too
-      if (isKlingO1) {
+    // OPTIMIZED: Try to use URLs for both images when possible to avoid large base64 payloads
+    // This significantly reduces request size and prevents 503 errors
+    const isTailPublicUrl = params.endImageUrl && (params.endImageUrl.startsWith('http://') || params.endImageUrl.startsWith('https://'));
+    
+    // FIX: Kling O1 requires base64 image data (image field) instead of image_url
+    // This is different from other models which can use image_url for public URLs
+    // Kling O1 must always use base64, regardless of whether URL is public or not
+    if (isKlingO1) {
+      // Kling O1 requires base64 even for public URLs
+      console.log(`📦 Converting image to base64 (Kling O1 requirement): ${trimmedImageUrl.substring(0, 50)}...`);
+      try {
+        const base64DataUri = await imageUrlToBase64(trimmedImageUrl);
+        imageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
+        if (!imageData || imageData.length === 0) {
+          throw new Error("Base64 conversion returned empty data");
+        }
+        console.log(`✅ Image converted to base64 for Kling O1 (${imageData.length} chars)`);
+      } catch (error: any) {
+        console.error(`❌ Failed to convert image to base64 for Kling O1:`, error.message);
+        throw new Error(`Failed to convert image to base64 for Kling O1: ${error.message}`);
+      }
+      
+      // Handle tail image for Kling O1 - always convert to base64
+      if (params.endImageUrl) {
+        console.log(`📦 Converting tail image to base64 (Kling O1 requirement): ${params.endImageUrl.substring(0, 50)}...`);
         try {
           const base64DataUri = await imageUrlToBase64(params.endImageUrl);
           tailImageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
           if (!tailImageData || tailImageData.length === 0) {
             throw new Error("Base64 conversion returned empty data");
           }
+          console.log(`✅ Tail image converted to base64 for Kling O1 (${tailImageData.length} chars)`);
         } catch (error: any) {
           console.error(`❌ Failed to convert tail image to base64 for Kling O1:`, error.message);
+          throw new Error(`Failed to convert tail image to base64 for Kling O1: ${error.message}`);
+        }
+      }
+    } else if (params.endImageUrl && isPublicUrl) {
+      // FIX: When image_tail_url is provided, Kling API requires main image as base64 (image field)
+      // instead of image_url. This is a requirement when using image_tail_url.
+      // When tail image is provided, convert main image to base64 (API requirement)
+      console.log(`📦 Converting main image to base64 (required when using image_tail_url): ${trimmedImageUrl.substring(0, 50)}...`);
+      try {
+        const base64DataUri = await imageUrlToBase64(trimmedImageUrl);
+        imageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
+        if (!imageData || imageData.length === 0) {
+          throw new Error("Base64 conversion returned empty data");
+        }
+        console.log(`✅ Main image converted to base64 (${imageData.length} chars)`);
+      } catch (error: any) {
+        console.error(`❌ Failed to convert main image to base64:`, error.message);
+        throw new Error(`Failed to convert main image to base64: ${error.message}`);
+      }
+      
+      // Use URL for tail image when it's a public URL
+      if (isTailPublicUrl) {
+        tailImageUrl = params.endImageUrl.trim();
+        console.log(`✅ Using direct URL for tail image: ${tailImageUrl.substring(0, 50)}...`);
+      } else {
+        // Tail image is not a public URL, convert to base64
+        console.log(`📦 Converting tail image to base64: ${params.endImageUrl.substring(0, 50)}...`);
+        try {
+          const base64DataUri = await imageUrlToBase64(params.endImageUrl);
+          tailImageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
+          if (!tailImageData || tailImageData.length === 0) {
+            throw new Error("Base64 conversion returned empty data");
+          }
+          console.log(`✅ Tail image converted to base64 (${tailImageData.length} chars)`);
+        } catch (error: any) {
+          console.error(`❌ Failed to convert tail image to base64:`, error.message);
           throw new Error(`Failed to convert tail image to base64: ${error.message}`);
         }
-      } else {
-        const isTailPublicUrl = params.endImageUrl.startsWith('http://') || params.endImageUrl.startsWith('https://');
-        
+      }
+    } else if (isPublicUrl && !params.endImageUrl) {
+      // OPTIMIZED: Use URLs when no tail image is provided (much smaller request size)
+      // This prevents 503 errors from oversized requests
+      imageUrl = trimmedImageUrl;
+      console.log(`✅ Using direct URL for main image: ${imageUrl.substring(0, 50)}...`);
+    } else {
+      // Fallback: Convert to base64 for local files or when main image is not public
+      // This is slower but necessary when URLs are not available
+      console.log(`📦 Converting main image to base64 (slower method): ${trimmedImageUrl.substring(0, 50)}...`);
+      try {
+        const base64DataUri = await imageUrlToBase64(trimmedImageUrl);
+        imageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
+        if (!imageData || imageData.length === 0) {
+          throw new Error("Base64 conversion returned empty data");
+        }
+        console.log(`✅ Main image converted to base64 (${imageData.length} chars) - this may take longer`);
+      } catch (error: any) {
+        console.error(`❌ Failed to convert image to base64:`, error.message);
+        throw new Error(`Failed to convert image to base64: ${error.message}`);
+      }
+      
+      if (params.endImageUrl) {
         if (isTailPublicUrl) {
-          tailImageUrl = params.endImageUrl;
+          // Tail image is public URL, use it directly (even if main image is base64)
+          tailImageUrl = params.endImageUrl.trim();
+          console.log(`✅ Using direct URL for tail image: ${tailImageUrl.substring(0, 50)}...`);
         } else {
+          // Convert tail image to base64
+          console.log(`📦 Converting tail image to base64 (slower method): ${params.endImageUrl.substring(0, 50)}...`);
           try {
             const base64DataUri = await imageUrlToBase64(params.endImageUrl);
             tailImageData = base64DataUri.replace(/^data:image\/[a-z]+;base64,/, '');
+            if (!tailImageData || tailImageData.length === 0) {
+              throw new Error("Base64 conversion returned empty data");
+            }
+            console.log(`✅ Tail image converted to base64 (${tailImageData.length} chars) - this may take longer`);
           } catch (error: any) {
             console.error(`❌ Failed to convert tail image to base64:`, error.message);
             throw new Error(`Failed to convert tail image to base64: ${error.message}`);
@@ -325,12 +376,24 @@ export class KlingService {
       request.callback_url = this.callbackUrl;
     }
 
-    // OPTIMIZED: Use URL directly when available (faster), fallback to base64
-    if (imageUrl && imageUrl.trim() !== '') {
-      request.image_url = imageUrl.trim();  // Use "image_url" for public URLs
+    // FIX: Kling O1 requires base64 image data (image field), not image_url
+    // For other models, use URL when available (faster), fallback to base64
+    if (isKlingO1) {
+      // Kling O1 must use base64 image field
+      if (imageData && imageData.length > 0) {
+        request.image = imageData;
+        console.log(`📤 Sending base64 image data to Kling O1 API (${imageData.length} chars)`);
+      } else {
+        console.error(`❌ Kling O1 requires base64 image data, but conversion failed: imageData length=${imageData?.length || 0}`);
+        throw new Error("Kling O1 requires base64 image data. Failed to convert image to base64.");
+      }
+    } else if (imageUrl && imageUrl.trim() !== '') {
+      // Other models can use image_url for public URLs (faster)
+      request.image_url = imageUrl.trim();
       console.log(`📤 Sending image_url to Kling API: ${imageUrl.substring(0, 50)}...`);
     } else if (imageData && imageData.length > 0) {
-      request.image = imageData;  // Use "image" field for base64 data
+      // Fallback to base64 for other models
+      request.image = imageData;
       console.log(`📤 Sending base64 image data to Kling API (${imageData.length} chars)`);
     } else {
       // CRITICAL: Ensure image is always provided
@@ -339,10 +402,16 @@ export class KlingService {
     }
 
     // Add tail frame if provided (URL or base64)
-    if (tailImageUrl) {
-      request.image_tail_url = tailImageUrl;  // Use URL for tail frame
-    } else if (tailImageData) {
-      request.image_tail = tailImageData;  // Use base64 for tail frame
+    // FIX: Kling O1 requires base64 for tail image as well
+    if (isKlingO1 && tailImageData && tailImageData.length > 0) {
+      request.image_tail = tailImageData;  // Kling O1 uses base64
+      console.log(`📤 Sending base64 image_tail data to Kling O1 API (${tailImageData.length} chars)`);
+    } else if (tailImageUrl && tailImageUrl.trim() !== '') {
+      request.image_tail_url = tailImageUrl.trim();  // Use URL for tail frame (other models)
+      console.log(`📤 Sending image_tail_url to Kling API: ${tailImageUrl.substring(0, 50)}...`);
+    } else if (tailImageData && tailImageData.length > 0) {
+      request.image_tail = tailImageData;  // Use base64 for tail frame (other models)
+      console.log(`📤 Sending base64 image_tail data to Kling API (${tailImageData.length} chars)`);
     }
 
     // Only add cfg_scale for v1.x models (v2.x doesn't support it)
@@ -368,45 +437,67 @@ export class KlingService {
     }
     console.log(`🚀 Sending image2video request to Kling API:`, JSON.stringify(requestDebug, null, 2));
 
-    try {
-      const response = await this.client.post<KlingGenerationResponse>(
-        "/v1/videos/image2video",
-        request,
-        { headers: this.getAuthHeaders() }
-      );
-
-      return response.data;
-    } catch (error: any) {
-      // Log detailed error information
-      console.error(`❌ Kling API Error:`, {
-        status: error.response?.status,
-        statusText: error.response?.statusText,
-        data: error.response?.data,
-        message: error.message,
-        url: error.config?.url,
-        method: error.config?.method
-      });
-
-      if (error.response?.status === 401) {
-        throw new Error(
-          `Kling API authentication failed: ${error.response?.data?.message || "Invalid credentials"}. ` +
-          `Please verify your KLING_ACCESS_KEY and KLING_SECRET_KEY are correct.`
+    // Retry logic for 503 errors (Service Unavailable) - often caused by oversized requests
+    const MAX_RETRIES = 3;
+    let lastError: any = null;
+    
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const response = await this.client.post<KlingGenerationResponse>(
+          "/v1/videos/image2video",
+          request,
+          { 
+            headers: this.getAuthHeaders(),
+            timeout: 120000 // 120s timeout for large requests
+          }
         );
+
+        return response.data;
+      } catch (error: any) {
+        lastError = error;
+        
+        // Log detailed error information
+        console.error(`❌ Kling API Error (attempt ${attempt}/${MAX_RETRIES}):`, {
+          status: error.response?.status,
+          statusText: error.response?.statusText,
+          data: error.response?.data,
+          message: error.message,
+          url: error.config?.url,
+          method: error.config?.method
+        });
+
+        if (error.response?.status === 401) {
+          throw new Error(
+            `Kling API authentication failed: ${error.response?.data?.message || "Invalid credentials"}. ` +
+            `Please verify your KLING_ACCESS_KEY and KLING_SECRET_KEY are correct.`
+          );
+        }
+        
+        // Retry on 503 errors (Service Unavailable) - often temporary
+        if (error.response?.status === 503 && attempt < MAX_RETRIES) {
+          const waitTime = attempt * 2000; // Exponential backoff: 2s, 4s, 6s
+          console.log(`⏳ Retrying after ${waitTime}ms due to 503 error...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          continue;
+        }
+        
+        // Don't retry on other errors or if max retries reached
+        break;
       }
-      
-      // Include response data in error message if available
-      const errorMessage = error.response?.data?.message || 
-                          error.response?.data?.error || 
-                          error.message || 
-                          "Unknown error";
-      const errorCode = error.response?.data?.code || 
-                       error.response?.data?.error_code || 
-                       "UNKNOWN_ERROR";
-      
-      throw new Error(
-        `Kling API error (${error.response?.status || 'N/A'}): ${errorCode} - ${errorMessage}`
-      );
     }
+    
+    // If we get here, all retries failed
+    const errorMessage = lastError?.response?.data?.message || 
+                        lastError?.response?.data?.error || 
+                        lastError?.message || 
+                        "Unknown error";
+    const errorCode = lastError?.response?.data?.code || 
+                     lastError?.response?.data?.error_code || 
+                     "UNKNOWN_ERROR";
+    
+    throw new Error(
+      `Kling API error (${lastError?.response?.status || 'N/A'}): ${errorCode} - ${errorMessage}`
+    );
   }
 
   /**

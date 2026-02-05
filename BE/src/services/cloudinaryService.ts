@@ -1,26 +1,46 @@
 import { v2 as cloudinary } from 'cloudinary';
 import fs from 'fs';
 import path from 'path';
+import { uploadsDir } from '../utils/storage';
 
-// Configure Cloudinary
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-});
+// Check if Cloudinary is configured
+const isCloudinaryConfigured = (): boolean => {
+  return !!(
+    process.env.CLOUDINARY_CLOUD_NAME &&
+    process.env.CLOUDINARY_API_KEY &&
+    process.env.CLOUDINARY_API_SECRET
+  );
+};
+
+// Configure Cloudinary only if credentials are provided
+if (isCloudinaryConfigured()) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+} else {
+  console.log('⚠️  Cloudinary not configured - files will be stored locally only');
+}
 
 /**
- * Upload a file to Cloudinary
+ * Upload a file to Cloudinary (or return local URL if Cloudinary not configured)
  * @param filePath - Local file path
  * @param resourceType - 'image' or 'video'
  * @param folder - Optional folder name in Cloudinary
- * @returns Public URL of uploaded file
+ * @returns Public URL of uploaded file (Cloudinary URL or local /uploads/ URL)
  */
 export async function uploadToCloudinary(
   filePath: string,
   resourceType: 'image' | 'video' = 'video',
   folder: string = 'createai'
 ): Promise<string> {
+  // If Cloudinary is not configured, return local URL
+  if (!isCloudinaryConfigured()) {
+    const filename = path.basename(filePath);
+    return `/uploads/${filename}`;
+  }
+
   try {
     const result = await cloudinary.uploader.upload(filePath, {
       resource_type: resourceType,
@@ -31,7 +51,10 @@ export async function uploadToCloudinary(
 
     return result.secure_url;
   } catch (error: any) {
-    throw new Error(`Failed to upload to Cloudinary: ${error.message}`);
+    // Fallback to local URL if Cloudinary upload fails
+    console.error(`⚠️  Cloudinary upload failed, using local URL: ${error.message}`);
+    const filename = path.basename(filePath);
+    return `/uploads/${filename}`;
   }
 }
 
@@ -57,14 +80,35 @@ export async function uploadLocalFileToCloudinary(
 }
 
 /**
- * Delete a file from Cloudinary
- * @param publicId - Public ID of the file (from URL)
+ * Delete a file from Cloudinary (or local storage if Cloudinary not configured)
+ * @param publicId - Public ID of the file (from URL) or local filename
  * @param resourceType - 'image' or 'video'
  */
 export async function deleteFromCloudinary(
   publicId: string,
   resourceType: 'image' | 'video' = 'video'
 ): Promise<void> {
+  // If Cloudinary is not configured, try to delete local file
+  if (!isCloudinaryConfigured()) {
+    try {
+      // If publicId is a local filename or /uploads/ path
+      const filename = publicId.includes('/uploads/') 
+        ? publicId.split('/uploads/').pop() 
+        : publicId;
+      
+      if (filename) {
+        const filePath = path.join(uploadsDir, filename);
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          console.log(`🗑️  Deleted local file: ${filename}`);
+        }
+      }
+    } catch (error: any) {
+      // Silent fail for local deletion
+    }
+    return;
+  }
+
   try {
     await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
   } catch (error: any) {
@@ -88,9 +132,12 @@ export function extractPublicId(url: string): string | null {
   }
 }
 
+export { isCloudinaryConfigured };
+
 export default {
   uploadToCloudinary,
   uploadLocalFileToCloudinary,
   deleteFromCloudinary,
   extractPublicId,
+  isCloudinaryConfigured,
 };

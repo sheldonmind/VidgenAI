@@ -1,5 +1,6 @@
-import { Router } from "express";
+import { Router, Request, Response } from "express";
 import { tiktokService } from "../services/tiktokService";
+import { visitTikTokAccountAndGetVideos } from "../services/tiktokBrowserService";
 import prisma from "../prisma";
 import path from "path";
 import axios from "axios";
@@ -217,6 +218,41 @@ router.post("/post/:generationId", async (req, res) => {
 });
 
 /**
+ * Visit TikTok account with Playwright, extract videos, save to DB
+ * Returns first video URL for FE to open in new tab
+ */
+router.post("/visit-account", async (req, res) => {
+  try {
+    const { accountUrl } = req.body;
+    if (!accountUrl || typeof accountUrl !== "string") {
+      res.status(400).json({ error: "accountUrl is required" });
+      return;
+    }
+    const result = await visitTikTokAccountAndGetVideos(accountUrl);
+    if (!result.success) {
+      res.status(500).json({
+        error: result.error || "Failed to visit TikTok account",
+        accountUrl: result.accountUrl,
+      });
+      return;
+    }
+    res.json({
+      success: true,
+      accountUrl: result.accountUrl,
+      openedVideoUrl: result.openedVideoUrl,
+      downloadedVideoPath: result.downloadedVideoPath,
+      downloadedVideoFilename: result.downloadedVideoFilename,
+      message: result.openedVideoUrl
+        ? "Browser opened, account visited, and a random video was opened"
+        : "Browser opened and account visited, but no videos were found to open",
+    });
+  } catch (error: unknown) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    res.status(500).json({ error: errMsg });
+  }
+});
+
+/**
  * Get TikTok settings for auto-post
  */
 router.get("/settings", async (req, res) => {
@@ -250,7 +286,8 @@ router.put("/settings", async (req, res) => {
         id: "default",
         autoPostMotionControl: autoPostMotionControl ?? false,
         defaultPrivacyLevel: defaultPrivacyLevel ?? "PUBLIC_TO_EVERYONE",
-        defaultTitle: defaultTitle ?? ""
+        defaultTitle: defaultTitle ?? "",
+        updatedAt: new Date()
       }
     });
 

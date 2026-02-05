@@ -98,6 +98,20 @@ Request (multipart/form-data):
 
 Uploaded files are stored in `uploads/` and served from `/uploads/...`.
 
+## TikTok (Sandbox & Visit account)
+
+- **OAuth (Login Kit)**: Use `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET`, and `TIKTOK_REDIRECT_URI` from your [TikTok Developer](https://developers.tiktok.com/) app. For **Sandbox**, use the Sandbox credentials and set `TIKTOK_REDIRECT_URI` to the **exact** "Login Kit" > Redirect URI (Web) from Sandbox (e.g. `https://your-tunnel.trycloudflare.com/api/v1/tiktok/callback`). Add your TikTok account as a **Target User** in Sandbox settings so it can authorize the app.
+- **Visit account – dùng đúng Chrome đang mở localhost:5173 (không mở Chrome for Testing)**: Khi bấm "Visit account", tab TikTok sẽ mở trong **cùng cửa sổ Chrome** mà bạn đang dùng app:
+  1. Đóng hết Google Chrome.
+  2. Mở Chrome có bật remote debugging **và chỉ định profile** (để không hiện "Who's using Chrome?"):  
+     **macOS:** `"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --profile-directory="Default"`  
+     (Nếu bạn dùng profile khác, đổi `Default` thành `Profile 1`, `Profile 2`, … tương ứng.)  
+     **Windows:** `chrome.exe --remote-debugging-port=9222 --profile-directory=Default`
+  3. Trong Chrome đó mở `http://localhost:5173` (app) và đăng nhập TikTok nếu cần.
+  4. Trong `.env` (thư mục BE) thêm: `TIKTOK_CHROME_CDP_URL=http://localhost:9222`
+  5. Bấm "Visit account" → backend kết nối vào Chrome này và mở **tab mới** đến TikTok (không có cửa sổ Chrome for Testing).
+- **Visit account – profile riêng**: Nếu không set `TIKTOK_CHROME_CDP_URL`, app sẽ mở thêm cửa sổ Chromium/Chrome for Testing. Chạy `npm run tiktok-login` một lần để đăng nhập TikTok trong profile đó.
+
 ## Environment variables
 
 | Variable | Description | Example |

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Link2, Unlink, Settings, Check, AlertCircle, Loader2 } from 'lucide-react';
+import { Link2, Unlink, Settings, Check, AlertCircle, Loader2, ExternalLink } from 'lucide-react';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000/api/v1';
 
@@ -18,6 +18,8 @@ const TikTokSettings = ({ onClose }) => {
   });
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState({ type: '', text: '' });
+  const [accountUrlInput, setAccountUrlInput] = useState('');
+  const [visitLoading, setVisitLoading] = useState(false);
 
   // Fetch TikTok connection status
   useEffect(() => {
@@ -91,6 +93,31 @@ const TikTokSettings = ({ onClose }) => {
     }
   };
 
+  const handleVisitAccount = async () => {
+    if (!accountUrlInput.trim()) {
+      setMessage({ type: 'error', text: 'Please enter a TikTok account URL' });
+      return;
+    }
+    setVisitLoading(true);
+    setMessage({ type: '', text: '' });
+    try {
+      const response = await fetch(`${API_BASE_URL}/tiktok/visit-account`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accountUrl: accountUrlInput.trim() }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to visit account');
+      }
+      setMessage({ type: 'success', text: 'Browser opened. Account visited and first video clicked.' });
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message || 'Failed to visit TikTok account' });
+    } finally {
+      setVisitLoading(false);
+    }
+  };
+
   const handleSaveSettings = async () => {
     setSaving(true);
     try {
@@ -141,6 +168,35 @@ const TikTokSettings = ({ onClose }) => {
               <span className="text-sm">{message.text}</span>
             </div>
           )}
+
+          {/* Visit TikTok Account */}
+          <div className="bg-zinc-800 rounded-xl p-4">
+            <h3 className="text-sm font-medium text-zinc-400 mb-3">Visit TikTok Account</h3>
+            <p className="text-zinc-400 text-xs mb-3">
+              Enter a TikTok account link to visit and open the first video in a new tab
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={accountUrlInput}
+                onChange={(e) => setAccountUrlInput(e.target.value)}
+                placeholder="https://tiktok.com/@username"
+                className="flex-1 bg-zinc-700 border border-zinc-600 rounded-lg px-3 py-2 text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-pink-500"
+              />
+              <button
+                onClick={handleVisitAccount}
+                disabled={visitLoading}
+                className="flex items-center gap-2 px-4 py-2 bg-cyan-500 text-white rounded-lg hover:bg-cyan-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {visitLoading ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <ExternalLink className="w-4 h-4" />
+                )}
+                <span>{visitLoading ? 'Loading...' : 'Visit & Open Video'}</span>
+              </button>
+            </div>
+          </div>
 
           {/* Connection Status */}
           <div className="bg-zinc-800 rounded-xl p-4">

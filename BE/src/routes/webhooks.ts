@@ -123,61 +123,98 @@ router.post("/kling", async (req, res, next) => {
       const imageUrl = parsed.task_result?.images?.[0]?.url;
       
       if (videoUrl) {
-        // OPTIMIZED: Process video with parallel download/upload
-        try {
-          const { videoUrl: cloudinaryVideoUrl, thumbnailUrl: cloudinaryThumbnailUrl } = 
-            await processVideoWebhook(generation.id, videoUrl, thumbnailUrl);
-          
-          await prisma.generation.update({
-            where: { id: generation.id },
-            data: {
-              status: "completed",
-              videoUrl: cloudinaryVideoUrl,
-              thumbnailUrl: cloudinaryThumbnailUrl,
-              updatedAt: new Date()
-            }
+        // FIX: Update status to "completed" immediately with Kling URL so frontend sees completion right away
+        // Then process Cloudinary upload in background and update URLs when done
+        await prisma.generation.update({
+          where: { id: generation.id },
+          data: {
+            status: "completed",
+            videoUrl: videoUrl, // Store Kling URL temporarily so frontend can show video immediately
+            thumbnailUrl: thumbnailUrl || videoUrl, // Use thumbnail if available, otherwise video URL
+            updatedAt: new Date()
+          }
+        });
+        console.log(`✅ [Webhook] Video generation completed (Kling URL): ${generation.id}`);
+        
+        // Process Cloudinary upload asynchronously in background (don't block webhook response)
+        // This allows frontend to see completion immediately while upload happens in background
+        processVideoWebhook(generation.id, videoUrl, thumbnailUrl)
+          .then(({ videoUrl: cloudinaryVideoUrl, thumbnailUrl: cloudinaryThumbnailUrl }) => {
+            return prisma.generation.update({
+              where: { id: generation.id },
+              data: {
+                videoUrl: cloudinaryVideoUrl, // Update to Cloudinary URL when ready
+                thumbnailUrl: cloudinaryThumbnailUrl,
+                updatedAt: new Date()
+              }
+            });
+          })
+          .then(() => {
+            console.log(`✅ [Webhook] Video uploaded to Cloudinary: ${generation.id}`);
+          })
+          .catch((processError: any) => {
+            // Don't fail the generation if Cloudinary upload fails - Kling URL is already stored
+            console.error(`⚠️ [Webhook] Failed to upload to Cloudinary (Kling URL still available):`, processError.message);
+            // Optionally update with error message but keep status as completed
+            prisma.generation.update({
+              where: { id: generation.id },
+              data: {
+                errorMessage: `Cloudinary upload failed, using Kling URL: ${processError.message}`,
+                updatedAt: new Date()
+              }
+            }).catch(() => {}); // Ignore update errors
           });
-          
-          console.log(`✅ [Webhook] Video generation completed: ${generation.id}`);
-        } catch (processError: any) {
-          console.error(`❌ [Webhook] Failed to process video:`, processError.message);
-          await prisma.generation.update({
-            where: { id: generation.id },
-            data: {
-              status: "failed",
-              errorMessage: `Webhook processing failed: ${processError.message}`,
-              updatedAt: new Date()
-            }
-          });
-        }
       } else if (imageUrl) {
-        // Handle image generation
-        try {
-          const imageFilename = await downloadAndSaveThumbnail(imageUrl, undefined);
-          const cloudinaryImageUrl = await uploadLocalFileToCloudinary(imageFilename, 'image');
-          
-          await prisma.generation.update({
-            where: { id: generation.id },
-            data: {
-              status: "completed",
-              imageUrl: cloudinaryImageUrl,
-              thumbnailUrl: cloudinaryImageUrl,
-              updatedAt: new Date()
-            } as any
+        // Handle image generation - update status immediately with Kling URL
+        await prisma.generation.update({
+          where: { id: generation.id },
+          data: {
+            status: "completed",
+            imageUrl: imageUrl, // Store Kling URL temporarily
+            thumbnailUrl: imageUrl,
+            updatedAt: new Date()
+          } as any
+        });
+        console.log(`✅ [Webhook] Image generation completed (Kling URL): ${generation.id}`);
+        
+        // Process Cloudinary upload asynchronously in background
+        downloadAndSaveThumbnail(imageUrl, undefined)
+          .then((imageFilename) => uploadLocalFileToCloudinary(imageFilename, 'image'))
+          .then((cloudinaryImageUrl) => {
+            return prisma.generation.update({
+              where: { id: generation.id },
+              data: {
+                imageUrl: cloudinaryImageUrl, // Update to Cloudinary URL when ready
+                thumbnailUrl: cloudinaryImageUrl,
+                updatedAt: new Date()
+              } as any
+            });
+          })
+          .then(() => {
+            console.log(`✅ [Webhook] Image uploaded to Cloudinary: ${generation.id}`);
+          })
+          .catch((processError: any) => {
+            // Don't fail the generation if Cloudinary upload fails - Kling URL is already stored
+            console.error(`⚠️ [Webhook] Failed to upload image to Cloudinary (Kling URL still available):`, processError.message);
+            // Optionally update with error message but keep status as completed
+            prisma.generation.update({
+              where: { id: generation.id },
+              data: {
+                errorMessage: `Cloudinary upload failed, using Kling URL: ${processError.message}`,
+                updatedAt: new Date()
+              }
+            }).catch(() => {}); // Ignore update errors
           });
-          
-          console.log(`✅ [Webhook] Image generation completed: ${generation.id}`);
-        } catch (processError: any) {
-          console.error(`❌ [Webhook] Failed to process image:`, processError.message);
-          await prisma.generation.update({
-            where: { id: generation.id },
-            data: {
-              status: "failed",
-              errorMessage: `Webhook processing failed: ${processError.message}`,
-              updatedAt: new Date()
-            }
-          });
-        }
+      } else {
+        // No video or image URL provided, but status is succeed - mark as completed anyway
+        await prisma.generation.update({
+          where: { id: generation.id },
+          data: {
+            status: "completed",
+            updatedAt: new Date()
+          }
+        });
+        console.log(`✅ [Webhook] Generation marked as completed (no media URLs): ${generation.id}`);
       }
     } else if (status === "failed") {
       await prisma.generation.update({
@@ -189,9 +226,15 @@ router.post("/kling", async (req, res, next) => {
         }
       });
       console.log(`❌ [Webhook] Generation failed: ${generation.id}`);
+    } else {
+      // Log other statuses for debugging
+      console.log(`ℹ️ [Webhook] Received status "${status}" for generation ${generation.id} (no action taken)`);
     }
 
+    // FIX: Respond immediately to webhook (don't wait for async processing)
+    // This ensures Kling API knows we received the webhook
     res.json({ success: true, received: true });
+    console.log(`✅ [Webhook] Response sent for generation ${generation.id}`);
   } catch (error) {
     console.error(`❌ [Webhook] Error processing webhook:`, error);
     next(error);

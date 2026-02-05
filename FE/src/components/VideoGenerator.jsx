@@ -2,8 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Play, Image, Video, Zap, History, Info, ChevronRight, Upload, Trash2, Settings, X } from 'lucide-react';
 import VideoModelSelector from './VideoModelSelector';
 import TikTokSettings from './TikTokSettings';
+import InteriorStagesGenerator from './InteriorStagesGenerator';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000/api/v1';
+// Extract backend base URL (remove /api/v1)
+const BACKEND_BASE_URL = API_BASE_URL.replace('/api/v1', '') || 'http://localhost:4000';
 const FALLBACK_THUMBNAIL = 'https://placehold.co/600x400?text=Generating';
 
 // Helper function to format date and time
@@ -98,6 +101,30 @@ const mapGeneration = (generation) => {
   const needsProxy = generation.videoUrl?.includes('generativelanguage.googleapis.com');
   const needsThumbnailProxy = generation.thumbnailUrl?.includes('generativelanguage.googleapis.com');
   
+  // Helper to prepend backend base URL for local paths
+  const resolveUrl = (url) => {
+    if (!url) return null;
+    // If it's already a full URL (http/https), return as is
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      return url;
+    }
+    // If it's a local path starting with /uploads/, prepend backend base URL
+    if (url.startsWith('/uploads/')) {
+      return `${BACKEND_BASE_URL}${url}`;
+    }
+    // Otherwise return as is (might be relative path or data URL)
+    return url;
+  };
+  
+  const rawVideoUrl = generation.videoUrl || generation.imageUrl || generation.thumbnailUrl || generation.inputImageUrl;
+  const rawThumbnailUrl = generation.thumbnailUrl || generation.imageUrl || generation.inputImageUrl;
+  
+  // Check if thumbnail URL is a video file - if so, use thumbnail endpoint
+  const isVideoThumbnail = rawThumbnailUrl && /\.(mp4|mov|avi|webm|mkv)$/i.test(rawThumbnailUrl);
+  const thumbnailUrl = needsThumbnailProxy || isVideoThumbnail
+    ? `${API_BASE_URL}/generations/${generation.id}/thumbnail`
+    : (resolveUrl(rawThumbnailUrl) || FALLBACK_THUMBNAIL);
+  
   return {
     id: generation.id,
     prompt: generation.prompt || '',
@@ -111,16 +138,14 @@ const mapGeneration = (generation) => {
     errorMessage: generation.errorMessage,
     createdAt: new Date(generation.createdAt),
     updatedAt: generation.updatedAt ? new Date(generation.updatedAt) : null,
-    thumbnail: needsThumbnailProxy 
-      ? `${API_BASE_URL}/generations/${generation.id}/thumbnail`
-      : (generation.thumbnailUrl || generation.imageUrl || generation.inputImageUrl || FALLBACK_THUMBNAIL),
+    thumbnail: thumbnailUrl,
     videoUrl: needsProxy 
       ? `${API_BASE_URL}/generations/${generation.id}/video`
-      : (generation.videoUrl || generation.imageUrl || generation.thumbnailUrl || generation.inputImageUrl || FALLBACK_THUMBNAIL),
-    imageUrl: generation.imageUrl,
-    inputImageUrl: generation.inputImageUrl,
-    inputVideoUrl: generation.inputVideoUrl,
-    characterImageUrl: generation.characterImageUrl
+      : (resolveUrl(rawVideoUrl) || FALLBACK_THUMBNAIL),
+    imageUrl: resolveUrl(generation.imageUrl),
+    inputImageUrl: resolveUrl(generation.inputImageUrl),
+    inputVideoUrl: resolveUrl(generation.inputVideoUrl),
+    characterImageUrl: resolveUrl(generation.characterImageUrl)
   };
 };
 
@@ -451,7 +476,7 @@ const VideoGenerator = () => {
 
     const loadGenerations = async () => {
       try {
-        const response = await fetch(`${API_BASE_URL}/generations?limit=50`);
+        const response = await fetch(`${API_BASE_URL}/generations?limit=20`);
         if (!response.ok) {
           throw new Error(`Failed to load generations (${response.status})`);
         }
@@ -534,6 +559,59 @@ const VideoGenerator = () => {
 
     return () => clearInterval(interval);
   }, [generations]);
+
+  // FIX: Auto-poll in_progress generations to detect status changes from webhooks
+  // This ensures we catch status updates from webhooks even if the initial polling stopped
+  useEffect(() => {
+    const inProgressGenerations = generations.filter(gen => gen.status === 'in_progress');
+    
+    if (inProgressGenerations.length === 0) {
+      return; // No in-progress generations to poll
+    }
+
+    console.log(`🔄 Auto-polling ${inProgressGenerations.length} in-progress generation(s)`);
+
+    const pollInterval = setInterval(async () => {
+      // Check status for each in-progress generation
+      for (const gen of inProgressGenerations) {
+        try {
+          const response = await fetch(`${API_BASE_URL}/generations/${gen.id}`);
+          if (response.ok) {
+            const payload = await response.json();
+            const updated = mapGeneration(payload.data);
+            
+            // Update state if status changed
+            setGenerations(prev => {
+              const currentGen = prev.find(g => g.id === gen.id);
+              if (!currentGen || currentGen.status === updated.status) {
+                return prev; // No change needed
+              }
+              
+              console.log(`✅ Status changed for generation ${gen.id}: "${currentGen.status}" → "${updated.status}"`);
+              
+              // Stop timer if completed
+              if (updated.status === 'completed' || updated.status === 'failed') {
+                setGenerationTimer(null);
+                
+                // Show TikTok upload notification if video completed successfully
+                if (updated.status === 'completed' && tiktokConnected) {
+                  setTiktokUploadModal({ show: true, video: updated });
+                }
+              }
+              
+              return prev.map(g => (g.id === updated.id ? updated : g));
+            });
+          }
+        } catch (error) {
+          console.error(`❌ Error polling generation ${gen.id}:`, error);
+        }
+      }
+    }, 5000); // Poll every 5 seconds
+
+    return () => {
+      clearInterval(pollInterval);
+    };
+  }, [generations, tiktokConnected]);
 
   const handleGenerate = async () => {
     const mode = getCurrentMode();
@@ -623,6 +701,7 @@ const VideoGenerator = () => {
       const poll = async () => {
         if (attempts >= maxAttempts) {
           // Stop timer on timeout
+          console.warn(`⏰ Polling timeout for generation ${created.id} after ${maxAttempts} attempts`);
           setGenerationTimer(null);
           return;
         }
@@ -631,6 +710,7 @@ const VideoGenerator = () => {
         try {
           const statusResponse = await fetch(`${API_BASE_URL}/generations/${created.id}`);
           if (!statusResponse.ok) {
+            console.warn(`⚠️ Status check failed (${statusResponse.status}) for generation ${created.id}, attempt ${attempts}`);
             // Only retry if still under max attempts
             if (attempts < maxAttempts) {
               setTimeout(poll, pollInterval);
@@ -642,12 +722,15 @@ const VideoGenerator = () => {
           const statusPayload = await statusResponse.json();
           const updated = mapGeneration(statusPayload.data);
 
+          console.log(`🔄 Polling generation ${created.id}: status="${updated.status}", attempt ${attempts}/${maxAttempts}`);
+
           setGenerations(prev =>
             prev.map(gen => (gen.id === updated.id ? updated : gen))
           );
 
           // Stop polling immediately when completed or failed - no more polling needed
           if (updated.status === 'completed' || updated.status === 'failed') {
+            console.log(`✅ Polling stopped for generation ${created.id}: status="${updated.status}"`);
             // Stop timer when completed or failed
             setGenerationTimer(null);
 
@@ -656,15 +739,19 @@ const VideoGenerator = () => {
               setTiktokUploadModal({ show: true, video: updated });
             }
             return; // Stop polling
-          } else if (updated.status === 'in_progress') {
-            // Only continue polling if still in progress
+          } else {
+            // FIX: Continue polling for any other status (in_progress, null, undefined, etc.)
+            // This ensures we don't miss status updates
+            console.log(`⏳ Continuing polling for generation ${created.id} (status: "${updated.status}")`);
             setTimeout(poll, pollInterval);
           }
         } catch (error) {
+          console.error(`❌ Error polling generation ${created.id}:`, error);
           // Only retry if still under max attempts
           if (attempts < maxAttempts) {
             setTimeout(poll, pollInterval);
           } else {
+            console.error(`❌ Polling failed after ${maxAttempts} attempts for generation ${created.id}`);
             setGenerationTimer(null);
           }
         }
@@ -721,8 +808,10 @@ const VideoGenerator = () => {
         } else if (updated.status === 'failed') {
           console.error(`❌ Video ${videoId} failed:`, updated.errorMessage, '- stopping poll');
           return; // Stop polling
-        } else if (updated.status === 'in_progress') {
-          // Only continue polling if still in progress
+        } else {
+          // FIX: Continue polling for any other status (in_progress, null, undefined, etc.)
+          // This ensures we don't miss status updates
+          console.log(`⏳ Continuing polling for video ${videoId} (status: "${updated.status}")`);
           setTimeout(poll, pollInterval);
         }
       } catch (error) {
@@ -1267,8 +1356,44 @@ const VideoGenerator = () => {
     <div className="min-h-screen bg-neutral-950 text-white overflow-y-auto">
       {/* Centered Content Container */}
       <div className="max-w-6xl mx-auto py-8 px-6">
+        {/* Tabs Navigation */}
+        <div className="flex gap-2 mb-6 border-b border-neutral-800">
+          <button
+            onClick={() => setActiveTab('text-to-video')}
+            className={`px-4 py-2 font-medium transition-colors ${
+              activeTab === 'text-to-video'
+                ? 'text-white border-b-2 border-blue-500'
+                : 'text-neutral-400 hover:text-white'
+            }`}
+          >
+            Video Generation
+          </button>
+          <button
+            onClick={() => setActiveTab('interior-stages')}
+            className={`px-4 py-2 font-medium transition-colors ${
+              activeTab === 'interior-stages'
+                ? 'text-white border-b-2 border-purple-500'
+                : 'text-neutral-400 hover:text-white'
+            }`}
+          >
+            Interior Transformation
+          </button>
+        </div>
+
         {/* Form Section */}
         <div className="space-y-4 mb-12">
+          {activeTab === 'interior-stages' && (
+            <InteriorStagesGenerator
+              selectedModel={selectedModel}
+              setSelectedModel={setSelectedModel}
+              models={models}
+              selectedVideoModel={selectedVideoModel}
+              setSelectedVideoModel={setSelectedVideoModel}
+              aspectRatio={aspectRatio}
+              resolution={resolution}
+              onGenerationsUpdate={(gen) => setGenerations(prev => [gen, ...prev])}
+            />
+          )}
           {activeTab === 'text-to-video' && (
             <>
               {/* Dynamic Mode Banner */}

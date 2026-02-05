@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { z } from "zod";
 import { randomUUID } from "crypto";
+import fs from "fs";
+import path from "path";
 import prisma from "../prisma";
 import { upload } from "../middleware/upload";
 import { parseBoolean } from "../utils/parse";
@@ -13,6 +15,8 @@ import { downloadAndSaveVideo, downloadAndSaveThumbnail, generateVideoThumbnail,
 import { uploadLocalFileToCloudinary, deleteFromCloudinary, extractPublicId } from "../services/cloudinaryService";
 import axios from "axios";
 import { CONSTRUCTION_STAGES, BASE_PROMPT, buildStagePrompt, getAllStages, getVideoTransitionPrompt, getVideoTitle, generateVideoTransitions, getIntermediateImagePrompt } from "../config/constructionStages";
+import { INTERIOR_STAGES, BASE_INTERIOR_PROMPT, buildInteriorStagePrompt, getAllInteriorStages, getImageStages, getInteriorVideoTransitionPrompt, getInteriorVideoTitle, generateInteriorVideoTransitions } from "../config/interiorStages";
+import { getModelCapabilities, getNearestSupportedDuration } from "../config/modelCapabilities";
 
 const router = Router();
 
@@ -1848,13 +1852,49 @@ router.get("/:id/thumbnail", async (req, res, next) => {
       return;
     }
 
-    if (!generation.thumbnailUrl) {
+    // If thumbnailUrl is a video file, generate thumbnail from it
+    const thumbnailUrl = generation.thumbnailUrl || generation.videoUrl;
+    
+    if (!thumbnailUrl) {
       res.status(404).json({ error: "Thumbnail URL not available yet" });
       return;
     }
 
-    if (generation.thumbnailUrl.includes("generativelanguage.googleapis.com")) {
-      const response = await axios.get(generation.thumbnailUrl, {
+    // Check if thumbnailUrl is a video file (.mp4, .mov, etc.)
+    const isVideoFile = thumbnailUrl.match(/\.(mp4|mov|avi|webm|mkv)$/i);
+    
+    if (isVideoFile && thumbnailUrl.includes("/uploads/")) {
+      // Extract filename from URL
+      const filename = thumbnailUrl.split("/uploads/").pop();
+      if (filename) {
+        try {
+          // Generate thumbnail from video
+          const thumbnailFilename = await generateVideoThumbnail(filename);
+          const thumbnailPath = path.join(__dirname, "../../uploads", thumbnailFilename);
+          
+          // Check if file exists
+          if (fs.existsSync(thumbnailPath)) {
+            // Update database with thumbnail URL
+            await prisma.generation.update({
+              where: { id: generation.id },
+              data: { thumbnailUrl: `/uploads/${thumbnailFilename}` }
+            });
+            
+            // Serve the thumbnail
+            res.setHeader("Content-Type", "image/jpeg");
+            res.setHeader("Cache-Control", "public, max-age=31536000");
+            res.sendFile(thumbnailPath);
+            return;
+          }
+        } catch (error: any) {
+          console.error(`Failed to generate thumbnail for ${generation.id}:`, error.message);
+          // Fall through to redirect to video (browser will extract frame)
+        }
+      }
+    }
+
+    if (thumbnailUrl.includes("generativelanguage.googleapis.com")) {
+      const response = await axios.get(thumbnailUrl, {
         responseType: "stream",
         headers: {
           "x-goog-api-key": process.env.GOOGLE_API_KEY || ""
@@ -1868,7 +1908,7 @@ router.get("/:id/thumbnail", async (req, res, next) => {
       res.setHeader("Cache-Control", "public, max-age=31536000");
       response.data.pipe(res);
     } else {
-      res.redirect(generation.thumbnailUrl);
+      res.redirect(thumbnailUrl);
     }
   } catch (error: any) {
     next(error);
@@ -1881,6 +1921,18 @@ const constructionStagesSchema = z.object({
   videoModelName: z.string().optional().default("Kling O1"),
   aspectRatio: z.string().optional().default("16:9"),
   basePrompt: z.string().optional()
+});
+
+const interiorStagesSchema = z.object({
+  inputImageUrl: z.string().url().optional(),
+  modelName: z.string().optional().default("Nano Banana"),
+  videoModelName: z.string().optional().default("Kling O1"),
+  aspectRatio: z.string().optional().default("16:9"),
+  // Custom prompts - user can input their own prompts
+  startFramePrompt: z.string().optional(), // Prompt for start frame image
+  endFramePrompt: z.string().optional(),   // Prompt for end frame image
+  videoPrompt: z.string().optional(),       // Prompt for video generation
+  duration: z.string().optional() // Duration for video generation (e.g., "5s", "10s")
 });
 
 async function waitForImageGeneration(
@@ -2933,6 +2985,570 @@ router.post("/construction-stages", upload.fields([{ name: "image", maxCount: 1 
       videosSubmitted: videoResults.filter(v => v.status === 'in_progress').length,
       videosFailed: videoResults.filter(v => v.status === 'failed').length,
       totalVideoDuration: videoResults.length * 5
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        success: false,
+        error: "Validation failed",
+        details: error.errors.map(err => ({
+          path: err.path.join('.'),
+          message: err.message
+        }))
+      });
+    }
+
+    next(error);
+  }
+});
+
+/**
+ * Interior transformation stages endpoint
+ * POST /generations/interior-stages
+ * 
+ * NEW WORKFLOW (simplified):
+ * 1. IMAGE 1: Start Frame - generated from user's startFramePrompt
+ * 2. IMAGE 2: End Frame - generated from user's endFramePrompt
+ * 3. VIDEO: Start Frame → End Frame transition using videoPrompt
+ * 
+ * User can manually input prompts and select duration based on video model
+ */
+router.post("/interior-stages", upload.fields([{ name: "image", maxCount: 1 }]), async (req, res, next) => {
+  try {
+    const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
+    const imageFile = files?.image?.[0];
+    
+    let parsed;
+    try {
+      parsed = interiorStagesSchema.parse(req.body);
+    } catch (validationError: any) {
+      if (!imageFile) {
+        if (validationError.errors) {
+          return res.status(400).json({
+            success: false,
+            error: "Validation failed",
+            details: validationError.errors.map((err: any) => ({
+              path: err.path.join('.'),
+              message: err.message
+            }))
+          });
+        }
+        throw validationError;
+      }
+      parsed = { modelName: "Nano Banana", videoModelName: "Kling O1", aspectRatio: "16:9" };
+    }
+    
+    const { 
+      inputImageUrl: providedImageUrl, 
+      modelName, 
+      videoModelName, 
+      aspectRatio, 
+      startFramePrompt,  // Custom prompt for start frame
+      endFramePrompt,    // Custom prompt for end frame
+      videoPrompt,       // Custom prompt for video
+      duration 
+    } = parsed;
+
+    let inputImageUrl: string | undefined;
+    
+    if (providedImageUrl) {
+      inputImageUrl = providedImageUrl;
+    } else if (imageFile) {
+      inputImageUrl = await uploadLocalFileToCloudinary(imageFile.filename, 'image');
+    }
+    // If no input image provided, stage 1 will use text-to-image generation
+
+    // Check which service to use based on model name
+    const lowerModelName = modelName?.toLowerCase() || '';
+    const isNanoBananaModel = lowerModelName.includes('nano banana');
+    const isKlingModel = lowerModelName.includes('kling');
+    
+    if (isNanoBananaModel && !geminiImageService.isConfigured()) {
+      return res.status(500).json({
+        success: false,
+        error: "Gemini Image service is not configured. Please check your Google API key."
+      });
+    }
+    
+    if (isKlingModel && !klingService.isConfigured()) {
+      return res.status(500).json({
+        success: false,
+        error: "Kling AI service is not configured. Please check your API credentials."
+      });
+    }
+
+    // Get image stages (start-frame and end-frame)
+    const imageStages = getImageStages();
+    console.log(`🏠 Interior stages: Generating ${imageStages.length} images (Start Frame + End Frame)`);
+    
+    // Custom prompts mapping for each stage
+    const customPrompts: Record<string, string | undefined> = {
+      'start-frame': startFramePrompt,
+      'end-frame': endFramePrompt
+    };
+    
+    const results: Array<{
+      stageKey: string;
+      stageOrder: number;
+      prompt: string;
+      imageUrl: string;
+      generationId: string;
+      success: boolean;
+      error?: string;
+    }> = [];
+
+    let currentImageUrl = inputImageUrl;
+    let parentGenerationId: string | undefined = undefined;
+
+    // Generate images sequentially (start-frame, end-frame)
+    for (const stage of imageStages) {
+      try {
+        // Use custom prompt if provided, otherwise use default stage prompt
+        const customPrompt = customPrompts[stage.stageKey];
+        const fullPrompt = buildInteriorStagePrompt(stage, customPrompt, true);
+        const isFirstStage = stage.stageOrder === 1;
+        const useTextToImage = isFirstStage && !currentImageUrl && stage.strength === 0 && isNanoBananaModel;
+
+        const generationId = randomUUID();
+        const generation = await prisma.generation.create({
+          data: {
+            id: generationId,
+            prompt: fullPrompt,
+            modelName: modelName || "Nano Banana",
+            duration: "0s",
+            aspectRatio: aspectRatio || "16:9",
+            resolution: "720p",
+            audioEnabled: false,
+            feature: useTextToImage ? "text-to-image" : "image-to-image",
+            generationType: useTextToImage ? "text-to-image" : "image-to-image",
+            status: "in_progress",
+            inputImageUrl: currentImageUrl || null,
+            updatedAt: new Date()
+          } as any
+        });
+
+        let result: { imageUrl: string; success: boolean; error?: string };
+
+        if (isNanoBananaModel) {
+          // Use Gemini service for Nano Banana model
+          try {
+            const geminiResponse = useTextToImage
+              ? await geminiImageService.generateTextToImage({
+                  prompt: fullPrompt,
+                  aspectRatio: aspectRatio || "16:9",
+                  modelName: modelName || "Nano Banana"
+                })
+              : await geminiImageService.generateImageToImage({
+                  imageUrl: currentImageUrl!,
+                  prompt: fullPrompt,
+                  aspectRatio: aspectRatio || "16:9",
+                  modelName: modelName || "Nano Banana"
+                });
+
+            const imageUrl = geminiImageService.extractImageUrl(geminiResponse);
+            
+            if (imageUrl && imageUrl.startsWith('data:')) {
+              // Convert base64 data URI to file and upload
+              const base64Data = imageUrl.split(',')[1];
+              const buffer = Buffer.from(base64Data, 'base64');
+              const filename = `gemini-interior-${Date.now()}.png`;
+              const fs = await import('fs/promises');
+              const path = await import('path');
+              const uploadsDir = path.join(process.cwd(), 'uploads');
+              await fs.mkdir(uploadsDir, { recursive: true });
+              const filepath = path.join(uploadsDir, filename);
+              await fs.writeFile(filepath, buffer);
+              
+              const cloudinaryImageUrl = await uploadLocalFileToCloudinary(filename, 'image');
+              
+              await prisma.generation.update({
+                where: { id: generationId },
+                data: {
+                  status: "completed",
+                  imageUrl: cloudinaryImageUrl,
+                  thumbnailUrl: cloudinaryImageUrl,
+                  updatedAt: new Date()
+                } as any
+              });
+
+              result = { imageUrl: cloudinaryImageUrl, success: true };
+            } else {
+              throw new Error("Gemini API did not return image data");
+            }
+          } catch (geminiError: any) {
+            await prisma.generation.update({
+              where: { id: generationId },
+              data: {
+                status: "failed",
+                errorMessage: geminiError.message,
+                updatedAt: new Date()
+              }
+            });
+            result = { imageUrl: "", success: false, error: geminiError.message };
+          }
+        } else {
+          // Use Kling service for Kling models (requires input image)
+          if (!currentImageUrl) {
+            throw new Error("Kling models require an input image. Please provide inputImageUrl or upload an image file.");
+          }
+          
+          const klingResponse = await klingService.generateImageToImage({
+            imageUrl: currentImageUrl,
+            prompt: fullPrompt,
+            aspectRatio: aspectRatio || "16:9",
+            strength: stage.strength,
+            modelName: modelName || "Nano Banana"
+          });
+
+          if (!klingResponse.data?.task_id) {
+            throw new Error("Kling API returned unexpected response format");
+          }
+
+          await prisma.generation.update({
+            where: { id: generationId },
+            data: {
+              providerJobId: klingResponse.data.task_id,
+              status: "in_progress"
+            }
+          });
+
+          result = await waitForImageGeneration(
+            generationId,
+            klingResponse.data.task_id,
+            modelName || "Nano Banana"
+          );
+        }
+
+        if (result.success && result.imageUrl) {
+          currentImageUrl = result.imageUrl;
+          parentGenerationId = generationId;
+
+          results.push({
+            stageKey: stage.stageKey,
+            stageOrder: stage.stageOrder,
+            prompt: fullPrompt,
+            imageUrl: result.imageUrl,
+            generationId: generationId,
+            success: true
+          });
+        } else {
+          results.push({
+            stageKey: stage.stageKey,
+            stageOrder: stage.stageOrder,
+            prompt: fullPrompt,
+            imageUrl: "",
+            generationId: generationId,
+            success: false,
+            error: result.error || "Unknown error"
+          });
+
+          return res.status(207).json({
+            success: false,
+            message: `Generation stopped at stage ${stage.stageOrder}. Some stages completed successfully.`,
+            stages: results,
+            videos: [],
+            failedAtStage: stage.stageOrder
+          });
+        }
+      } catch (error: any) {
+        return res.status(207).json({
+          success: false,
+          message: `Error at stage ${stage.stageOrder}: ${error.message}`,
+          stages: results,
+          videos: [],
+          failedAtStage: stage.stageOrder,
+          error: error.message
+        });
+      }
+    }
+
+    // After all 2 images are generated, create 1 video
+    console.log("🎬 Generating 1 interior transformation video...");
+    
+    const selectedVideoModel = videoModelName || "Kling O1";
+    
+    // Determine duration based on model capabilities or user input
+    let videoDuration: string;
+    if (duration) {
+      // Validate and get nearest supported duration
+      const modelCapability = getModelCapabilities(selectedVideoModel);
+      if (modelCapability) {
+        videoDuration = getNearestSupportedDuration(selectedVideoModel, duration);
+        console.log(`📹 Using duration: ${videoDuration} (requested: ${duration}, model: ${selectedVideoModel})`);
+      } else {
+        videoDuration = duration;
+        console.log(`📹 Using requested duration: ${videoDuration} (model capabilities not found)`);
+      }
+    } else {
+      // Use default duration from model capabilities
+      const modelCapability = getModelCapabilities(selectedVideoModel);
+      videoDuration = modelCapability?.defaultDuration || "5s";
+      console.log(`📹 Using default duration: ${videoDuration} for model ${selectedVideoModel}`);
+    }
+    const videoResults: Array<{
+      videoNumber: number;
+      fromStage: string;
+      toStage: string;
+      fromStageOrder: number;
+      toStageOrder: number;
+      generationId: string;
+      status: string;
+      taskId?: string;
+      error?: string;
+      modelName?: string;
+    }> = [];
+
+    // Video: Start Frame → End Frame with both images as keyframes
+    const startFrame = results.find(s => s.stageKey === 'start-frame' && s.success);
+    const endFrame = results.find(s => s.stageKey === 'end-frame' && s.success);
+
+    const videoConfigs = [
+      {
+        videoNumber: 1,
+        fromStage: startFrame,
+        toStage: endFrame,
+        videoStage: INTERIOR_STAGES.find(s => s.stageKey === 'transformation-video')
+      }
+    ];
+
+    const MAX_CONCURRENT_VIDEOS = parseInt(process.env.KLING_MAX_CONCURRENT_VIDEOS || "2", 10);
+    const RETRY_DELAY_BASE = 30000;
+    const MAX_RETRIES = 5;
+    const SUBMISSION_DELAY = 5000;
+    const activeTaskIds: string[] = [];
+
+    // Helper function to check and clean up completed tasks
+    const cleanupCompletedTasks = async (): Promise<number> => {
+      const completedTaskIndices: number[] = [];
+      for (let idx = 0; idx < activeTaskIds.length; idx++) {
+        try {
+          const status = await klingService.checkGenerationStatus(activeTaskIds[idx], "image2video", selectedVideoModel);
+          const taskStatus = status.data?.task_status;
+          
+          if (taskStatus === "succeed" || taskStatus === "failed") {
+            completedTaskIndices.push(idx);
+            console.log(`✅ Task ${activeTaskIds[idx]} completed with status: ${taskStatus}`);
+          }
+        } catch (error: any) {
+          console.error(`⚠️ Error checking task status for ${activeTaskIds[idx]}: ${error.message}`);
+        }
+      }
+      
+      completedTaskIndices.reverse().forEach(idx => {
+        activeTaskIds.splice(idx, 1);
+      });
+      
+      return completedTaskIndices.length;
+    };
+
+    const waitForTaskSlot = async () => {
+      await cleanupCompletedTasks();
+      
+      if (activeTaskIds.length < MAX_CONCURRENT_VIDEOS) {
+        return;
+      }
+      
+      console.log(`⏳ Rate limit reached (${activeTaskIds.length}/${MAX_CONCURRENT_VIDEOS} active). Waiting for a task to complete...`);
+      
+      let pollCount = 0;
+      while (activeTaskIds.length >= MAX_CONCURRENT_VIDEOS) {
+        pollCount++;
+        const checkInterval = pollCount === 1 ? 10000 : 15000;
+        await new Promise(resolve => setTimeout(resolve, checkInterval));
+        
+        await cleanupCompletedTasks();
+        
+        if (pollCount > 60) {
+          console.warn(`⚠️ Waited too long for task slot. Proceeding anyway (may hit rate limit)`);
+          break;
+        }
+      }
+    };
+
+    // Generate videos
+    for (const config of videoConfigs) {
+      if (!config.fromStage || !config.toStage || !config.videoStage) {
+        console.warn(`⚠️ Skipping video ${config.videoNumber}: missing required stages`);
+        continue;
+      }
+
+      try {
+        await waitForTaskSlot();
+
+        // Use custom video prompt if provided, otherwise use default from stage config
+        const finalVideoPrompt = videoPrompt 
+          ? buildInteriorStagePrompt(config.videoStage, videoPrompt, true)
+          : buildInteriorStagePrompt(config.videoStage, undefined, true);
+        const videoTitle = config.videoStage.stageName;
+
+        let videoGenerationId: string | null = null;
+        let success = false;
+
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+          try {
+            videoGenerationId = randomUUID();
+            
+            await prisma.generation.create({
+              data: {
+                id: videoGenerationId,
+                prompt: finalVideoPrompt,
+                modelName: selectedVideoModel,
+                duration: videoDuration,
+                aspectRatio: aspectRatio || "16:9",
+                resolution: "720p",
+                audioEnabled: false,
+                feature: "image-to-video",
+                generationType: "image-to-video",
+                status: "in_progress",
+                inputImageUrl: config.fromStage.imageUrl,
+                updatedAt: new Date()
+              } as any
+            });
+
+            // Generate video with Start Frame and End Frame (keyframe interpolation)
+            const klingResponse = await klingService.generateImageToVideo({
+              imageUrl: config.fromStage.imageUrl,
+              endImageUrl: config.toStage.imageUrl, // Use end frame for smooth transition
+              prompt: finalVideoPrompt,
+              duration: videoDuration,
+              aspectRatio: aspectRatio || "16:9",
+              audioEnabled: false,
+              modelName: selectedVideoModel
+            });
+
+            if (!klingResponse.data?.task_id) {
+              throw new Error("Kling API returned unexpected response format");
+            }
+
+            await prisma.generation.update({
+              where: { id: videoGenerationId },
+              data: {
+                providerJobId: klingResponse.data.task_id,
+                status: "in_progress",
+                updatedAt: new Date()
+              }
+            });
+
+            activeTaskIds.push(klingResponse.data.task_id);
+
+            const taskType = "image2video";
+            const onVideoComplete = (taskId: string) => {
+              const index = activeTaskIds.indexOf(taskId);
+              if (index > -1) {
+                activeTaskIds.splice(index, 1);
+                console.log(`✅ Removed completed task ${taskId} from active list. ${activeTaskIds.length}/${MAX_CONCURRENT_VIDEOS} tasks remaining`);
+              }
+            };
+
+            pollKlingGeneration(videoGenerationId, klingResponse.data.task_id, taskType, selectedVideoModel, onVideoComplete).catch((error: any) => {
+              console.error(`❌ Failed to start polling for video ${config.videoNumber} (${videoGenerationId}):`, error.message);
+              const index = activeTaskIds.indexOf(klingResponse.data.task_id);
+              if (index > -1) {
+                activeTaskIds.splice(index, 1);
+              }
+            });
+
+            videoResults.push({
+              videoNumber: config.videoNumber,
+              fromStage: config.fromStage.stageKey,
+              toStage: config.toStage.stageKey,
+              fromStageOrder: config.fromStage.stageOrder,
+              toStageOrder: config.toStage.stageOrder,
+              generationId: videoGenerationId,
+              status: "in_progress",
+              taskId: klingResponse.data.task_id,
+              modelName: selectedVideoModel
+            });
+
+            success = true;
+            break;
+          } catch (error: any) {
+            if (videoGenerationId) {
+              await prisma.generation.update({
+                where: { id: videoGenerationId },
+                data: {
+                  status: "failed",
+                  errorMessage: error.message,
+                  updatedAt: new Date()
+                }
+              });
+            }
+
+            if (attempt < MAX_RETRIES) {
+              const delay = RETRY_DELAY_BASE * attempt;
+              console.log(`⏳ Retrying video ${config.videoNumber} (attempt ${attempt + 1}/${MAX_RETRIES}) after ${delay}ms...`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+              // Video failed after all retries - STOP THE PROCESS IMMEDIATELY
+              console.error(`❌ Video ${config.videoNumber} failed after ${MAX_RETRIES} attempts. Stopping pipeline.`);
+              videoResults.push({
+                videoNumber: config.videoNumber,
+                fromStage: config.fromStage.stageKey,
+                toStage: config.toStage.stageKey,
+                fromStageOrder: config.fromStage.stageOrder,
+                toStageOrder: config.toStage.stageOrder,
+                generationId: videoGenerationId || "",
+                status: "failed",
+                error: error.message,
+                modelName: selectedVideoModel
+              });
+              
+              // STOP: Return immediately when a video fails
+              return res.status(207).json({
+                success: false,
+                message: `Generation stopped: Video ${config.videoNumber} failed after ${MAX_RETRIES} attempts. ${error.message}`,
+                stages: results,
+                videos: videoResults,
+                videosSubmitted: videoResults.filter(v => v.status === 'in_progress').length,
+                videosFailed: videoResults.filter(v => v.status === 'failed').length,
+                failedAtStage: `video-${config.videoNumber}`,
+                error: error.message
+              });
+            }
+          }
+        }
+
+        if (success && config.videoNumber < videoConfigs.length) {
+          await new Promise(resolve => setTimeout(resolve, SUBMISSION_DELAY));
+        }
+      } catch (error: any) {
+        // STOP: If there's an unexpected error creating a video, stop immediately
+        console.error(`❌ Error creating video ${config.videoNumber}:`, error);
+        videoResults.push({
+          videoNumber: config.videoNumber,
+          fromStage: config.fromStage?.stageKey || "",
+          toStage: config.toStage?.stageKey || "",
+          fromStageOrder: config.fromStage?.stageOrder || 0,
+          toStageOrder: config.toStage?.stageOrder || 0,
+          generationId: "",
+          status: "failed",
+          error: error.message,
+          modelName: selectedVideoModel
+        });
+        
+        // STOP: Return immediately when there's an error
+        return res.status(207).json({
+          success: false,
+          message: `Generation stopped: Error creating video ${config.videoNumber}. ${error.message}`,
+          stages: results,
+          videos: videoResults,
+          videosSubmitted: videoResults.filter(v => v.status === 'in_progress').length,
+          videosFailed: videoResults.filter(v => v.status === 'failed').length,
+          failedAtStage: `video-${config.videoNumber}`,
+          error: error.message
+        });
+      }
+    }
+
+    const videoDurationSeconds = parseInt(videoDuration.replace('s', ''));
+    res.status(200).json({
+      success: true,
+      message: `Interior transformation pipeline initiated: ${results.filter(r => r.success).length}/${imageStages.length} images generated, ${videoResults.length} videos submitted`,
+      stages: results,
+      videos: videoResults,
+      videosSubmitted: videoResults.filter(v => v.status === 'in_progress').length,
+      videosFailed: videoResults.filter(v => v.status === 'failed').length,
+      totalVideoDuration: videoResults.length * videoDurationSeconds
     });
   } catch (error: any) {
     if (error instanceof z.ZodError) {

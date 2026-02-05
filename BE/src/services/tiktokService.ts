@@ -431,11 +431,13 @@ class TikTokService {
         scope: tokenData.scope
       },
       create: {
+        id: tokenData.open_id,
         openId: tokenData.open_id,
         accessToken: tokenData.access_token,
         refreshToken: tokenData.refresh_token,
         expiresAt: new Date(Date.now() + tokenData.expires_in * 1000),
-        scope: tokenData.scope
+        scope: tokenData.scope,
+        updatedAt: new Date()
       }
     });
   }

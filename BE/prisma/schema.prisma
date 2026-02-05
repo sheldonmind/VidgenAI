@@ -24,7 +24,6 @@ model Generation {
   characterImageUrl String?
   thumbnailUrl      String?
   videoUrl          String?
-  imageUrl          String?
   providerJobId     String?
   createdAt         DateTime @default(now())
   updatedAt         DateTime
@@ -33,6 +32,7 @@ model Generation {
   autoPostToTiktok  Boolean  @default(false)
   tiktokPostId      String?
   tiktokPostStatus  String?
+  imageUrl          String?
   Model             Model?   @relation(fields: [modelId], references: [id])
 
   @@index([createdAt])
@@ -67,4 +67,13 @@ model TiktokToken {
   scope        String
   createdAt    DateTime @default(now())
   updatedAt    DateTime
+}
+
+model TikTokAccountVisit {
+  id           String   @id @default(uuid())
+  accountUrl   String
+  username     String?
+  videos       String   // JSON array of video URLs
+  visitedAt    DateTime @default(now())
+  createdAt    DateTime @default(now())
 }
