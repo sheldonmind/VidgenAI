@@ -41,6 +41,10 @@ async function main() {
     });
   }
 
+  if (!context) {
+    throw new Error("No browser context available");
+  }
+
   const page = context.pages()[0] || (await context.newPage());
   await page.goto(TIKTOK_URL, { waitUntil: "domcontentloaded" });
 

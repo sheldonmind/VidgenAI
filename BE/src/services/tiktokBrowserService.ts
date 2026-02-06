@@ -85,8 +85,8 @@ export async function visitTikTokAccountAndGetVideos(accountUrl: string): Promis
     // Collect video URLs from the profile grid (links to /video/...)
     // TikTok sometimes lazy-loads the grid; do a small scroll + retry once.
     const collectVideoLinks = async () => {
-      return await page.$$eval('a[href*="/video/"]', (links) =>
-        [...new Set(links.map((a) => (a as HTMLAnchorElement).href).filter(Boolean))]
+      return await page.$$eval('a[href*="/video/"]', (links: { href: string }[]) =>
+        [...new Set(links.map((a) => a.href).filter(Boolean))]
       );
     };
 
@@ -100,8 +100,9 @@ export async function visitTikTokAccountAndGetVideos(accountUrl: string): Promis
     // Open a random video from the channel (if available)
     let openedVideoUrl: string | undefined;
     if (videoLinks.length) {
-      openedVideoUrl = videoLinks[Math.floor(Math.random() * videoLinks.length)];
-      await page.goto(openedVideoUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      const chosenUrl = videoLinks[Math.floor(Math.random() * videoLinks.length)];
+      openedVideoUrl = chosenUrl;
+      await page.goto(chosenUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
       // Wait for video page UI to appear (best-effort; selectors vary by locale/variant)
       await page
         .waitForSelector('video, [data-e2e="browse-video"], [data-e2e="video-player"]', { timeout: 15000 })
