@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { ChevronDown, Check, Zap, Sparkles } from 'lucide-react'
 
-const VideoModelSelector = ({ models, selectedModel, onModelChange }) => {
+const VideoModelSelector = ({ models, selectedModel, onModelChange, loading }) => {
   const [isOpen, setIsOpen] = useState(false)
   const dropdownRef = useRef(null)
 
@@ -17,6 +17,16 @@ const VideoModelSelector = ({ models, selectedModel, onModelChange }) => {
     document.addEventListener('mousedown', handleClickOutside)
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
+
+  // Loading state
+  if (loading) {
+    return (
+      <div className="w-full bg-neutral-900/50 border border-neutral-800 rounded-xl px-4 py-3 flex items-center justify-center gap-2">
+        <div className="h-4 w-4 border-2 border-neutral-500 border-t-neutral-300 rounded-full animate-spin" />
+        <span className="text-neutral-400 text-sm">Đang tải...</span>
+      </div>
+    )
+  }
 
   // Don't render if no models available
   if (!models || models.length === 0 || !currentModel) {

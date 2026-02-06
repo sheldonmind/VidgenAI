@@ -166,6 +166,8 @@ const FEATURE_LABELS = {
 const VideoGenerator = () => {
   const [activeTab, setActiveTab] = useState('text-to-video');
   const [models, setModels] = useState([]);
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [modelsError, setModelsError] = useState(null);
   const [selectedModel, setSelectedModel] = useState(null);
   const [selectedVideoModel, setSelectedVideoModel] = useState(null);
   const [selectedPreset, setSelectedPreset] = useState(null);
@@ -367,45 +369,44 @@ const VideoGenerator = () => {
   };
 
   // Load models from API
-  useEffect(() => {
-    let isActive = true;
-
-    const loadModels = async () => {
-      try {
-        const response = await fetch(`${API_BASE_URL}/models`);
-        if (!response.ok) {
-          throw new Error(`Failed to load models (${response.status})`);
-        }
-        const payload = await response.json();
-        if (!isActive) return;
-        const loadedModels = payload.data || [];
-        setModels(loadedModels);
-        if (loadedModels.length > 0 && !selectedModel) {
-          setSelectedModel(loadedModels[0]);
-        }
-        // Auto-select first video-capable model for video generation
-        if (loadedModels.length > 0 && !selectedVideoModel) {
-          const videoModels = loadedModels.filter(model => 
-            model.capabilities?.supportedFeatures?.includes('image-to-video') || 
-            model.capabilities?.supportedFeatures?.includes('text-to-video')
-          );
-          if (videoModels.length > 0) {
-            // Prefer Kling O1 if available, otherwise use first video model
-            const klingO1 = videoModels.find(m => m.name === 'Kling O1');
-            setSelectedVideoModel(klingO1 || videoModels[0]);
-          } else {
-            setSelectedVideoModel(loadedModels[0]);
-          }
-        }
-      } catch (error) {
-        console.error('❌ Failed to load models:', error);
+  const loadModels = async () => {
+    setModelsLoading(true);
+    setModelsError(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/models`);
+      if (!response.ok) {
+        throw new Error(`Failed to load models (${response.status})`);
       }
-    };
+      const payload = await response.json();
+      const loadedModels = payload.data || [];
+      setModels(loadedModels);
+      setModelsError(null);
+      if (loadedModels.length > 0 && !selectedModel) {
+        setSelectedModel(loadedModels[0]);
+      }
+      // Auto-select first video-capable model for video generation
+      if (loadedModels.length > 0 && !selectedVideoModel) {
+        const videoModels = loadedModels.filter(model =>
+          model.capabilities?.supportedFeatures?.includes('image-to-video') ||
+          model.capabilities?.supportedFeatures?.includes('text-to-video')
+        );
+        if (videoModels.length > 0) {
+          const klingO1 = videoModels.find(m => m.name === 'Kling O1');
+          setSelectedVideoModel(klingO1 || videoModels[0]);
+        } else {
+          setSelectedVideoModel(loadedModels[0]);
+        }
+      }
+    } catch (error) {
+      console.error('❌ Failed to load models:', error);
+      setModelsError(error?.message || 'Cannot connect to backend. Is the server running at ' + (API_BASE_URL.replace('/api/v1', '')) + '?');
+    } finally {
+      setModelsLoading(false);
+    }
+  };
 
+  useEffect(() => {
     loadModels();
-    return () => {
-      isActive = false;
-    };
   }, []);
 
   // Auto-select first compatible model when generation type changes
@@ -1356,6 +1357,34 @@ const VideoGenerator = () => {
     <div className="min-h-screen bg-neutral-950 text-white overflow-y-auto">
       {/* Centered Content Container */}
       <div className="max-w-6xl mx-auto py-8 px-6">
+        {/* Models loading / error banner */}
+        {modelsLoading && (
+          <div className="mb-6 rounded-xl bg-neutral-800/80 border border-neutral-700 px-4 py-3 flex items-center gap-3">
+            <div className="h-5 w-5 border-2 border-neutral-400 border-t-white rounded-full animate-spin" />
+            <span className="text-neutral-300">Đang tải danh sách model...</span>
+          </div>
+        )}
+        {modelsError && !modelsLoading && (
+          <div className="mb-6 rounded-xl bg-red-500/10 border border-red-500/30 px-4 py-3 flex flex-col sm:flex-row sm:items-center gap-3">
+            <div className="flex-1">
+              <p className="text-red-400 font-medium">Không tải được danh sách model</p>
+              <p className="text-neutral-400 text-sm mt-1">{modelsError}</p>
+            </div>
+            <button
+              onClick={() => loadModels()}
+              className="px-4 py-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-lg text-sm font-medium transition-colors"
+            >
+              Thử lại
+            </button>
+          </div>
+        )}
+        {!modelsLoading && !modelsError && models.length === 0 && (
+          <div className="mb-6 rounded-xl bg-amber-500/10 border border-amber-500/30 px-4 py-3">
+            <p className="text-amber-400 font-medium">Chưa có model nào trong database.</p>
+            <p className="text-neutral-400 text-sm mt-1">Trong thư mục BE chạy: <code className="bg-neutral-800 px-1 rounded">npm run seed</code></p>
+          </div>
+        )}
+
         {/* Tabs Navigation */}
         <div className="flex gap-2 mb-6 border-b border-neutral-800">
           <button
@@ -1387,6 +1416,7 @@ const VideoGenerator = () => {
               selectedModel={selectedModel}
               setSelectedModel={setSelectedModel}
               models={models}
+              modelsLoading={modelsLoading}
               selectedVideoModel={selectedVideoModel}
               setSelectedVideoModel={setSelectedVideoModel}
               aspectRatio={aspectRatio}
@@ -2064,6 +2094,7 @@ const VideoGenerator = () => {
                 models={filteredModels}
                 selectedModel={selectedModel}
                 onModelChange={setSelectedModel}
+                loading={modelsLoading}
               />
 
               {/* Model Capabilities Info */}
@@ -2199,6 +2230,7 @@ const VideoGenerator = () => {
                 models={filteredModels}
                 selectedModel={selectedModel}
                 onModelChange={setSelectedModel}
+                loading={modelsLoading}
               />
             </>
           )}
@@ -2293,6 +2325,7 @@ const VideoGenerator = () => {
                 models={filteredModels}
                 selectedModel={selectedModel}
                 onModelChange={setSelectedModel}
+                loading={modelsLoading}
               />
             </>
           )}
@@ -2361,6 +2394,7 @@ const VideoGenerator = () => {
                 models={filteredModels}
                 selectedModel={selectedModel}
                 onModelChange={setSelectedModel}
+                loading={modelsLoading}
               />
             </>
           )}
@@ -2393,6 +2427,7 @@ const VideoGenerator = () => {
                   model.capabilities?.supportedFeatures?.includes('text-to-video')
                 )}
                 selectedModel={selectedVideoModel}
+                loading={modelsLoading}
                 onModelChange={setSelectedVideoModel}
               />
             </div>

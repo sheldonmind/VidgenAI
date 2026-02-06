@@ -47,6 +47,7 @@ const InteriorStagesGenerator = ({
   selectedModel,
   setSelectedModel,
   models,
+  modelsLoading,
   selectedVideoModel,
   setSelectedVideoModel,
   aspectRatio = '16:9',
@@ -382,14 +383,19 @@ const InteriorStagesGenerator = ({
     };
   }, []);
 
-  // Safety check for required props
-  if (!models || models.length === 0) {
+  // Loading or no models
+  if (modelsLoading || !models || models.length === 0) {
     return (
       <div className="space-y-6">
-        <div className="bg-yellow-900/20 border border-yellow-500/30 rounded-xl p-4">
-          <div className="text-yellow-300 text-sm">
-            ⚠️ Loading models... Please wait.
-          </div>
+        <div className="bg-neutral-800/80 border border-neutral-700 rounded-xl p-4 flex items-center gap-3">
+          {modelsLoading ? (
+            <>
+              <div className="h-5 w-5 border-2 border-neutral-500 border-t-white rounded-full animate-spin" />
+              <span className="text-neutral-400 text-sm">Đang tải danh sách model...</span>
+            </>
+          ) : (
+            <span className="text-neutral-400 text-sm">Chưa có model. Kiểm tra banner phía trên hoặc chạy <code className="bg-neutral-700 px-1 rounded">npm run seed</code> trong BE.</span>
+          )}
         </div>
       </div>
     );
@@ -507,6 +513,7 @@ const InteriorStagesGenerator = ({
           )}
           selectedModel={selectedModel}
           onModelChange={setSelectedModel}
+          loading={modelsLoading}
         />
       </div>
 
@@ -522,6 +529,7 @@ const InteriorStagesGenerator = ({
           )}
           selectedModel={selectedVideoModel}
           onModelChange={setSelectedVideoModel}
+          loading={modelsLoading}
         />
       </div>
 
