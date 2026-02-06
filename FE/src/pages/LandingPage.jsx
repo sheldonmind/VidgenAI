@@ -2,7 +2,7 @@ import React, { useEffect } from 'react'
 
 // TEMPORARY: Landing page shows only TikTok verification text for domain verification.
 // Revert to full landing page after TikTok verification succeeds.
-const TIKTOK_VERIFY = 'tiktok-developers-site-verification=BV8iV1gr67xP6sFLNzTCQ1waqCFORDwm'
+const TIKTOK_VERIFY = 'tiktok-developers-site-verification=9ZmXlCTFB4n6biuoUgeGVK8LvWWGHutG'
 
 export default function LandingPage() {
   useEffect(() => {
