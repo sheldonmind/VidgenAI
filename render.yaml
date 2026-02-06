@@ -1,0 +1,12 @@
+# Render Blueprint - Backend (BE) only.
+# Cấu hình đúng để có thư mục dist/ sau build (tránh lỗi Cannot find module .../dist/server.js).
+# Nếu bạn đã tạo service thủ công: vào Dashboard → VidgenAI → Settings và đặt giống bên dưới.
+
+services:
+  - type: web
+    name: VidgenAI
+    runtime: node
+    rootDir: BE
+    buildCommand: npm install && npx prisma generate && npm run build
+    startCommand: npm run start
+    plan: free
